@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 from io import BytesIO
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -26,6 +26,20 @@ NASA_PARAMETERS: dict[str, str] = {
     "WS10M": "Швидкість вітру на висоті 10 м",
     "PS": "Атмосферний тиск біля поверхні",
 }
+
+SOLAR_COLUMNS = [
+    "ALLSKY_SFC_SW_DWN",
+    "ALLSKY_SFC_SW_DNI",
+    "ALLSKY_SFC_SW_DIFF",
+]
+
+METEO_COLUMNS = [
+    "T2M",
+    "RH2M",
+    "T2MDEW",
+    "WS10M",
+    "PS",
+]
 
 REQUIRED_PRODUCT_COLUMNS = {
     "product_id",
@@ -238,28 +252,121 @@ def infer_timezone(latitude: float, longitude: float) -> str:
     return result or "UTC"
 
 
-def parse_local_datetime(
-    text: str,
+def combine_local_datetime(
+    selected_date: date,
+    selected_time: time,
     timezone_name: str,
 ) -> datetime:
-    """Розбирає дату і час формату РРРР-ММ-ДД ГГ:ХХ."""
-    try:
-        naive = datetime.strptime(text.strip(), "%Y-%m-%d %H:%M")
-    except ValueError as exc:
-        raise ValueError(
-            "Дата і час мають бути у форматі РРРР-ММ-ДД ГГ:ХХ."
-        ) from exc
+    """Формує локальний datetime із заданим часовим поясом."""
+    return datetime.combine(
+        selected_date,
+        selected_time,
+        tzinfo=ZoneInfo(timezone_name),
+    )
 
-    return naive.replace(tzinfo=ZoneInfo(timezone_name))
+
+def is_day_mode(
+    timestamp: pd.Timestamp,
+    day_start: time,
+    day_end: time,
+) -> bool:
+    """
+    Визначає режим роботи за локальним часом.
+    Підтримує також інтервал, що перетинає опівніч.
+    """
+    current = timestamp.timetz().replace(tzinfo=None)
+
+    if day_start < day_end:
+        return day_start <= current < day_end
+
+    return current >= day_start or current < day_end
+
+
+def build_process_timeline(
+    start_local: datetime,
+    duration_hours: float,
+    step_minutes: int,
+    day_start: time,
+    day_end: time,
+) -> pd.DataFrame:
+    """
+    Формує часову шкалу моделі.
+    Кожний рядок відповідає початку розрахункового інтервалу.
+    """
+    duration_minutes = round(duration_hours * 60)
+
+    if duration_minutes <= 0:
+        raise ValueError("Тривалість процесу повинна бути більшою за нуль.")
+
+    if duration_minutes % step_minutes != 0:
+        raise ValueError(
+            "Тривалість процесу повинна ділитися на часовий крок без остачі."
+        )
+
+    intervals = duration_minutes // step_minutes
+    end_local = start_local + timedelta(minutes=duration_minutes)
+
+    index = pd.date_range(
+        start=start_local,
+        periods=intervals,
+        freq=f"{step_minutes}min",
+    )
+
+    timeline = pd.DataFrame(index=index)
+    timeline.index.name = "time_local"
+
+    timeline["operating_mode"] = [
+        "Денний режим"
+        if is_day_mode(ts, day_start, day_end)
+        else "Нічний режим"
+        for ts in timeline.index
+    ]
+
+    timeline["interval_minutes"] = step_minutes
+    timeline["elapsed_hours"] = (
+        (timeline.index - timeline.index[0])
+        .total_seconds()
+        / 3600
+    )
+
+    timeline.attrs["start_local"] = start_local
+    timeline.attrs["end_local"] = end_local
+    timeline.attrs["duration_hours"] = duration_hours
+    timeline.attrs["step_minutes"] = step_minutes
+    timeline.attrs["intervals"] = intervals
+
+    return timeline
+
+
+def summarize_process_timeline(
+    timeline: pd.DataFrame,
+    step_minutes: int,
+) -> dict[str, float]:
+    """Обчислює тривалість денного та нічного режимів."""
+    day_intervals = int(
+        (timeline["operating_mode"] == "Денний режим").sum()
+    )
+    night_intervals = int(
+        (timeline["operating_mode"] == "Нічний режим").sum()
+    )
+
+    return {
+        "intervals": len(timeline),
+        "day_intervals": day_intervals,
+        "night_intervals": night_intervals,
+        "day_hours": day_intervals * step_minutes / 60,
+        "night_hours": night_intervals * step_minutes / 60,
+    }
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_nasa_power(
     latitude: float,
     longitude: float,
-    start_text: str,
-    end_text: str,
-) -> tuple[pd.DataFrame, str, str]:
+    start_local_iso: str,
+    end_local_iso: str,
+    timezone_name: str,
+) -> tuple[pd.DataFrame, str, str, dict[str, Any]]:
     """Завантажує погодинні дані NASA POWER напряму через API."""
     latitude = float(latitude)
     longitude = float(longitude)
@@ -269,18 +376,14 @@ def fetch_nasa_power(
     if not -180 <= longitude <= 180:
         raise ValueError("Довгота повинна бути в межах від -180 до 180°.")
 
-    timezone_name = infer_timezone(latitude, longitude)
-    start_local = parse_local_datetime(start_text, timezone_name)
-    end_local = parse_local_datetime(end_text, timezone_name)
-
-    if end_local <= start_local:
-        raise ValueError(
-            "Час завершення повинен бути пізнішим за час початку."
-        )
+    start_local = datetime.fromisoformat(start_local_iso)
+    end_local = datetime.fromisoformat(end_local_iso)
 
     start_utc = start_local.astimezone(ZoneInfo("UTC"))
     end_utc = end_local.astimezone(ZoneInfo("UTC"))
 
+    # NASA POWER приймає календарні дати, тому завантажуємо повні доби,
+    # які перекривають потрібний локальний інтервал.
     query = {
         "parameters": ",".join(NASA_PARAMETERS.keys()),
         "community": "RE",
@@ -325,9 +428,14 @@ def fetch_nasa_power(
     frame = frame.apply(pd.to_numeric, errors="coerce")
     frame = frame.sort_index()
 
+    # Залишаємо невеликий запас довкола потрібного інтервалу.
+    # Він потрібний для інтерполяції метеорологічних параметрів.
+    buffer_start = start_local - timedelta(hours=1)
+    buffer_end = end_local + timedelta(hours=1)
+
     frame = frame.loc[
-        (frame.index >= start_local)
-        & (frame.index <= end_local)
+        (frame.index >= buffer_start)
+        & (frame.index <= buffer_end)
     ].copy()
 
     if frame.empty:
@@ -336,12 +444,257 @@ def fetch_nasa_power(
         )
 
     status = (
-        f"Отримано {len(frame)} погодинних записів. "
+        f"Отримано {len(frame)} погодинних записів NASA POWER. "
         f"Часовий пояс: {timezone_name}."
     )
 
-    return frame, status, response.url
+    parameter_metadata = payload.get("parameters", {})
 
+    return frame, status, response.url, parameter_metadata
+
+
+def build_10min_weather(
+    nasa_hourly: pd.DataFrame,
+    timeline: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Приводить погодинні дані NASA POWER до часової шкали моделі.
+
+    Сонячне випромінювання:
+    погодинне середнє значення поширюється на 10-хвилинні інтервали
+    відповідної години (forward fill). Це зберігає погодинне середнє
+    та не створює штучних внутрішньогодинних піків.
+
+    Температура, вологість, точка роси, вітер і тиск:
+    використовується лінійна інтерполяція в часі.
+    """
+    target_index = timeline.index
+    combined_index = nasa_hourly.index.union(target_index).sort_values()
+
+    result = pd.DataFrame(index=target_index)
+    result.index.name = "time_local"
+
+    solar = (
+        nasa_hourly[SOLAR_COLUMNS]
+        .reindex(combined_index)
+        .ffill()
+        .reindex(target_index)
+    )
+
+    meteo = (
+        nasa_hourly[METEO_COLUMNS]
+        .reindex(combined_index)
+        .interpolate(method="time")
+        .ffill()
+        .bfill()
+        .reindex(target_index)
+    )
+
+    result = result.join(solar)
+    result = result.join(meteo)
+    result.insert(
+        0,
+        "operating_mode",
+        timeline["operating_mode"],
+    )
+    result.insert(
+        1,
+        "elapsed_hours",
+        timeline["elapsed_hours"],
+    )
+
+    return result
+
+
+
+def saturation_vapor_pressure_kpa(temperature_c):
+    """
+    Тиск насиченої водяної пари над рідкою водою, кПа.
+
+    Використано інженерне наближення типу Magnus для температур,
+    характерних для сушіння та зовнішнього повітря.
+    """
+    import numpy as np
+
+    t = pd.Series(temperature_c, dtype="float64")
+    return 0.61094 * np.exp((17.625 * t) / (t + 243.04))
+
+
+def calculate_psychrometric_state(
+    weather_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Розраховує стан зовнішнього вологого повітря для кожного
+    часового інтервалу моделі.
+
+    Вихідні величини:
+    - p_ws_kpa: тиск насиченої водяної пари, кПа;
+    - p_v_kpa: парціальний тиск водяної пари, кПа;
+    - humidity_ratio_kg_kg: вологовміст, кг води/кг сухого повітря;
+    - enthalpy_kj_kg_da: ентальпія, кДж/кг сухого повітря;
+    - dew_point_calc_c: розрахункова температура точки роси, °C;
+    - dew_point_error_c: різниця між розрахунковою точкою роси
+      та T2MDEW NASA POWER, °C;
+    - moist_air_density_kg_m3: густина вологого повітря, кг/м³;
+    - specific_volume_m3_kg_da: питомий об'єм, м³/кг сухого повітря.
+    """
+    import numpy as np
+
+    required = {"T2M", "RH2M", "PS"}
+    missing = required - set(weather_df.columns)
+    if missing:
+        raise ValueError(
+            "Для психрометричного розрахунку відсутні стовпці: "
+            + ", ".join(sorted(missing))
+        )
+
+    result = weather_df.copy()
+
+    t_c = pd.to_numeric(result["T2M"], errors="coerce")
+    rh_pct = pd.to_numeric(result["RH2M"], errors="coerce")
+    p_kpa = pd.to_numeric(result["PS"], errors="coerce")
+
+    if t_c.isna().any() or rh_pct.isna().any() or p_kpa.isna().any():
+        raise ValueError(
+            "У часовому ряді є пропущені T2M, RH2M або PS. "
+            "Спочатку перевірте погодні дані."
+        )
+
+    if ((rh_pct < 0) | (rh_pct > 100)).any():
+        raise ValueError(
+            "Відносна вологість повинна бути в межах 0–100 %."
+        )
+
+    p_ws = saturation_vapor_pressure_kpa(t_c)
+    p_v = (rh_pct / 100.0) * p_ws
+
+    if (p_v >= p_kpa).any():
+        raise ValueError(
+            "Парціальний тиск водяної пари дорівнює або перевищує "
+            "атмосферний тиск. Перевірте вихідні дані."
+        )
+
+    # Вологовміст, кг води / кг сухого повітря
+    humidity_ratio = 0.621945 * p_v / (p_kpa - p_v)
+
+    # Ентальпія вологого повітря, кДж / кг сухого повітря
+    enthalpy = (
+        1.006 * t_c
+        + humidity_ratio * (2501.0 + 1.86 * t_c)
+    )
+
+    # Розрахункова температура точки роси через обернену формулу Magnus
+    # Використовуємо RH не нижче 1e-6, щоб уникнути log(0).
+    rh_fraction = (rh_pct / 100.0).clip(lower=1e-6)
+    gamma = np.log(rh_fraction) + (17.625 * t_c) / (243.04 + t_c)
+    dew_point_calc = 243.04 * gamma / (17.625 - gamma)
+
+    # Густина вологого повітря через суму парціальних густин.
+    # p у Па; температури в К.
+    t_k = t_c + 273.15
+    p_v_pa = p_v * 1000.0
+    p_da_pa = (p_kpa - p_v) * 1000.0
+
+    r_da = 287.055
+    r_v = 461.495
+
+    moist_air_density = (
+        p_da_pa / (r_da * t_k)
+        + p_v_pa / (r_v * t_k)
+    )
+
+    # Питомий об'єм на 1 кг сухого повітря
+    specific_volume = (
+        r_da * t_k * (1.0 + 1.607858 * humidity_ratio)
+        / (p_kpa * 1000.0)
+    )
+
+    result["p_ws_kpa"] = p_ws
+    result["p_v_kpa"] = p_v
+    result["humidity_ratio_kg_kg"] = humidity_ratio
+    result["humidity_ratio_g_kg"] = humidity_ratio * 1000.0
+    result["enthalpy_kj_kg_da"] = enthalpy
+    result["dew_point_calc_c"] = dew_point_calc
+    result["moist_air_density_kg_m3"] = moist_air_density
+    result["specific_volume_m3_kg_da"] = specific_volume
+
+    if "T2MDEW" in result.columns:
+        nasa_dew = pd.to_numeric(
+            result["T2MDEW"],
+            errors="coerce",
+        )
+        result["dew_point_error_c"] = (
+            result["dew_point_calc_c"] - nasa_dew
+        )
+        result["dew_point_abs_error_c"] = (
+            result["dew_point_error_c"].abs()
+        )
+
+    return result
+
+
+def summarize_psychrometrics(
+    psychro_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Формує коротку таблицю основних психрометричних показників."""
+    rows = [
+        (
+            "Середній вологовміст",
+            psychro_df["humidity_ratio_g_kg"].mean(),
+            "г води/кг сухого повітря",
+        ),
+        (
+            "Мінімальний вологовміст",
+            psychro_df["humidity_ratio_g_kg"].min(),
+            "г води/кг сухого повітря",
+        ),
+        (
+            "Максимальний вологовміст",
+            psychro_df["humidity_ratio_g_kg"].max(),
+            "г води/кг сухого повітря",
+        ),
+        (
+            "Середня ентальпія",
+            psychro_df["enthalpy_kj_kg_da"].mean(),
+            "кДж/кг сухого повітря",
+        ),
+        (
+            "Мінімальна розрахункова точка роси",
+            psychro_df["dew_point_calc_c"].min(),
+            "°C",
+        ),
+        (
+            "Максимальна розрахункова точка роси",
+            psychro_df["dew_point_calc_c"].max(),
+            "°C",
+        ),
+        (
+            "Середня густина вологого повітря",
+            psychro_df["moist_air_density_kg_m3"].mean(),
+            "кг/м³",
+        ),
+    ]
+
+    if "dew_point_abs_error_c" in psychro_df.columns:
+        rows.append(
+            (
+                "Середнє абсолютне відхилення точки роси від NASA",
+                psychro_df["dew_point_abs_error_c"].mean(),
+                "°C",
+            )
+        )
+        rows.append(
+            (
+                "Максимальне абсолютне відхилення точки роси від NASA",
+                psychro_df["dew_point_abs_error_c"].max(),
+                "°C",
+            )
+        )
+
+    return pd.DataFrame(
+        rows,
+        columns=["Показник", "Значення", "Одиниця"],
+    )
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
@@ -356,10 +709,10 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("Початкові дані моделі сонячної сушарки")
+st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Довідник продуктів — Google Sheets. "
-    "Метеорологічні дані — NASA POWER."
+    "Етапи 1–9: продукт, масовий баланс, режим сушіння, "
+    "погодні часові ряди та стан зовнішнього вологого повітря."
 )
 
 try:
@@ -369,17 +722,28 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_weather = st.tabs(
-    ["1. Продукт", "2. NASA POWER"]
+tab_product, tab_process, tab_weather, tab_psychro = st.tabs(
+    [
+        "1. Продукт",
+        "2. Тривалість і режими",
+        "3. Погодні дані NASA POWER",
+        "4. Стан вологого повітря",
+    ]
 )
 
+# ---------------------------------------------------------------------
+# 1. ПРОДУКТ
+# ---------------------------------------------------------------------
 with tab_product:
+    st.subheader("Етапи 1–5. Вихідні дані продукту")
+
     col1, col2 = st.columns(2)
 
     with col1:
         selected_name = st.selectbox(
             "Продукт",
             products["product_name_uk"].tolist(),
+            key="selected_product",
         )
 
     with col2:
@@ -389,6 +753,7 @@ with tab_product:
             value=30.0,
             step=1.0,
             format="%.3f",
+            key="initial_mass_kg",
         )
 
     product = products.loc[
@@ -454,6 +819,8 @@ with tab_product:
         float(product["final_moisture_pct"]),
     )
 
+    st.session_state["mass_balance"] = balance
+
     m1, m2, m3 = st.columns(3)
     m1.metric(
         "Маса сухої речовини",
@@ -509,11 +876,178 @@ with tab_product:
         hide_index=True,
     )
 
-    if st.button("Оновити довідник із Google Sheets"):
+    if st.button(
+        "Оновити довідник із Google Sheets",
+        key="refresh_products",
+    ):
         st.cache_data.clear()
         st.rerun()
 
+
+# ---------------------------------------------------------------------
+# 2. ТРИВАЛІСТЬ І РЕЖИМИ
+# ---------------------------------------------------------------------
+with tab_process:
+    st.subheader("Етапи 6–7. Тривалість процесу та денний/нічний режими")
+
+    st.info(
+        "На цьому етапі задається розрахунковий горизонт моделі. "
+        "Це не означає, що цільова вологість обов'язково буде досягнута "
+        "саме за цей час — надалі це перевірятиме модель сушіння."
+    )
+
+    p1, p2, p3 = st.columns(3)
+
+    with p1:
+        process_start_date = st.date_input(
+            "Дата початку процесу",
+            value=date(2025, 9, 1),
+            key="process_start_date",
+        )
+
+    with p2:
+        process_start_time = st.time_input(
+            "Час початку процесу",
+            value=time(8, 0),
+            step=600,
+            key="process_start_time",
+        )
+
+    with p3:
+        process_duration_hours = st.number_input(
+            "Задана тривалість процесу, год",
+            min_value=1.0,
+            max_value=720.0,
+            value=36.0,
+            step=1.0,
+            key="process_duration_hours",
+        )
+
+    r1, r2, r3 = st.columns(3)
+
+    with r1:
+        day_start_time = st.time_input(
+            "Початок денного режиму",
+            value=time(8, 0),
+            step=600,
+            key="day_start_time",
+        )
+
+    with r2:
+        day_end_time = st.time_input(
+            "Завершення денного режиму",
+            value=time(20, 0),
+            step=600,
+            key="day_end_time",
+        )
+
+    with r3:
+        model_step_minutes = st.selectbox(
+            "Часовий крок моделі, хв",
+            options=[5, 10, 15, 30, 60],
+            index=1,
+            key="model_step_minutes",
+        )
+
+    # Для попереднього відображення часовий пояс ще не потрібний.
+    # Використовуємо UTC як технічний tz; у вкладці NASA часова шкала
+    # буде перебудована в часовому поясі координат користувача.
+    preview_start = datetime.combine(
+        process_start_date,
+        process_start_time,
+        tzinfo=ZoneInfo("UTC"),
+    )
+
+    try:
+        preview_timeline = build_process_timeline(
+            start_local=preview_start,
+            duration_hours=process_duration_hours,
+            step_minutes=model_step_minutes,
+            day_start=day_start_time,
+            day_end=day_end_time,
+        )
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+
+    preview_summary = summarize_process_timeline(
+        preview_timeline,
+        model_step_minutes,
+    )
+
+    process_end_preview = (
+        preview_start
+        + timedelta(hours=float(process_duration_hours))
+    )
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric(
+        "Розрахункових інтервалів",
+        f"{preview_summary['intervals']}",
+    )
+    s2.metric(
+        "Активний денний режим",
+        f"{preview_summary['day_hours']:.1f} год",
+    )
+    s3.metric(
+        "Нічний режим",
+        f"{preview_summary['night_hours']:.1f} год",
+    )
+    s4.metric(
+        "Крок моделі",
+        f"{model_step_minutes} хв",
+    )
+
+    process_summary_table = pd.DataFrame(
+        {
+            "Параметр": [
+                "Початок процесу",
+                "Завершення процесу",
+                "Задана тривалість",
+                "Початок денного режиму",
+                "Завершення денного режиму",
+                "Тривалість активного денного режиму",
+                "Тривалість нічного режиму",
+                "Кількість розрахункових інтервалів",
+            ],
+            "Значення": [
+                f"{process_start_date} {process_start_time:%H:%M}",
+                f"{process_end_preview.date()} {process_end_preview.time():%H:%M}",
+                f"{process_duration_hours:.1f} год",
+                f"{day_start_time:%H:%M}",
+                f"{day_end_time:%H:%M}",
+                f"{preview_summary['day_hours']:.1f} год",
+                f"{preview_summary['night_hours']:.1f} год",
+                preview_summary["intervals"],
+            ],
+        }
+    )
+
+    st.dataframe(
+        process_summary_table,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    with st.expander("Показати часову шкалу режимів"):
+        preview_display = preview_timeline.reset_index().copy()
+        preview_display["time_local"] = (
+            preview_display["time_local"]
+            .dt.tz_localize(None)
+        )
+        st.dataframe(
+            preview_display,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# ---------------------------------------------------------------------
+# 3. NASA POWER ТА 10-ХВИЛИННИЙ РЯД
+# ---------------------------------------------------------------------
 with tab_weather:
+    st.subheader("Етап 8. Погодні часові ряди")
+
     c1, c2 = st.columns(2)
 
     with c1:
@@ -524,6 +1058,7 @@ with tab_weather:
             value=50.446236,
             step=0.000001,
             format="%.6f",
+            key="latitude",
         )
 
     with c2:
@@ -534,21 +1069,56 @@ with tab_weather:
             value=30.460662,
             step=0.000001,
             format="%.6f",
+            key="longitude",
         )
 
-    c3, c4 = st.columns(2)
+    timezone_name = infer_timezone(latitude, longitude)
 
-    with c3:
-        start_text = st.text_input(
-            "Початок, місцевий час",
-            value="2025-09-01 08:00",
-        )
+    start_local = combine_local_datetime(
+        process_start_date,
+        process_start_time,
+        timezone_name,
+    )
+    end_local = start_local + timedelta(
+        hours=float(process_duration_hours)
+    )
 
-    with c4:
-        end_text = st.text_input(
-            "Завершення, місцевий час",
-            value="2025-09-02 20:00",
+    st.write(
+        f"Визначений часовий пояс: `{timezone_name}`. "
+        f"Розрахунковий інтервал: "
+        f"**{start_local:%d.%m.%Y %H:%M} – {end_local:%d.%m.%Y %H:%M}**."
+    )
+
+    try:
+        model_timeline = build_process_timeline(
+            start_local=start_local,
+            duration_hours=process_duration_hours,
+            step_minutes=model_step_minutes,
+            day_start=day_start_time,
+            day_end=day_end_time,
         )
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+
+    model_summary = summarize_process_timeline(
+        model_timeline,
+        model_step_minutes,
+    )
+
+    n1, n2, n3 = st.columns(3)
+    n1.metric(
+        "Тривалість ряду",
+        f"{process_duration_hours:.1f} год",
+    )
+    n2.metric(
+        "Часовий крок моделі",
+        f"{model_step_minutes} хв",
+    )
+    n3.metric(
+        "Кількість інтервалів",
+        f"{model_summary['intervals']}",
+    )
 
     st.dataframe(
         pd.DataFrame(
@@ -561,42 +1131,304 @@ with tab_weather:
         hide_index=True,
     )
 
+    st.caption(
+        "NASA POWER надає погодинні середні значення. "
+        "У моделі сонячні показники поширюються на 10-хвилинні "
+        "інтервали відповідної години без створення штучних піків; "
+        "температура, відносна вологість, точка роси, вітер і тиск "
+        "лінійно інтерполюються між сусідніми погодинними значеннями."
+    )
+
     if st.button(
-        "Завантажити дані NASA POWER",
+        "Завантажити NASA POWER і сформувати ряд моделі",
         type="primary",
         use_container_width=True,
+        key="load_nasa",
     ):
-        with st.spinner("Отримання даних NASA POWER..."):
+        with st.spinner("Отримання та опрацювання даних NASA POWER..."):
             try:
-                nasa_df, status, request_url = fetch_nasa_power(
-                    latitude,
-                    longitude,
-                    start_text,
-                    end_text,
+                nasa_hourly, status, request_url, parameter_metadata = (
+                    fetch_nasa_power(
+                        latitude=latitude,
+                        longitude=longitude,
+                        start_local_iso=start_local.isoformat(),
+                        end_local_iso=end_local.isoformat(),
+                        timezone_name=timezone_name,
+                    )
                 )
+
+                weather_model = build_10min_weather(
+                    nasa_hourly=nasa_hourly,
+                    timeline=model_timeline,
+                )
+
             except Exception as exc:
                 st.error(str(exc))
             else:
-                st.session_state["nasa_df"] = nasa_df
+                st.session_state["nasa_hourly"] = nasa_hourly
+                st.session_state["weather_model"] = weather_model
                 st.session_state["nasa_status"] = status
                 st.session_state["nasa_request_url"] = request_url
+                st.session_state["nasa_parameter_metadata"] = (
+                    parameter_metadata
+                )
+                st.session_state["weather_timezone"] = timezone_name
 
-    if "nasa_df" in st.session_state:
-        nasa_df = st.session_state["nasa_df"]
+    if "weather_model" in st.session_state:
+        nasa_hourly = st.session_state["nasa_hourly"]
+        weather_model = st.session_state["weather_model"]
 
-        st.success(st.session_state["nasa_status"])
+        st.success(
+            st.session_state["nasa_status"]
+            + f" Сформовано {len(weather_model)} "
+            f"розрахункових інтервалів по {model_step_minutes} хв."
+        )
+
+        st.markdown("#### Погодинні вихідні дані NASA POWER")
         st.dataframe(
-            nasa_df,
+            nasa_hourly,
             use_container_width=True,
         )
 
-        with st.expander("Адреса запиту NASA POWER"):
+        st.markdown("#### Часовий ряд математичної моделі")
+        st.dataframe(
+            weather_model,
+            use_container_width=True,
+        )
+
+        st.markdown("#### Сонячне випромінювання")
+        st.line_chart(
+            weather_model[
+                [
+                    "ALLSKY_SFC_SW_DWN",
+                    "ALLSKY_SFC_SW_DNI",
+                    "ALLSKY_SFC_SW_DIFF",
+                ]
+            ],
+            use_container_width=True,
+        )
+
+        st.markdown("#### Температура зовнішнього повітря")
+        st.line_chart(
+            weather_model[["T2M", "T2MDEW"]],
+            use_container_width=True,
+        )
+
+        st.markdown("#### Відносна вологість зовнішнього повітря")
+        st.line_chart(
+            weather_model[["RH2M"]],
+            use_container_width=True,
+        )
+
+        with st.expander("Метадані та адреса запиту NASA POWER"):
             st.code(st.session_state["nasa_request_url"])
+            metadata = st.session_state.get(
+                "nasa_parameter_metadata",
+                {},
+            )
+            if metadata:
+                metadata_rows = []
+                for code, meta in metadata.items():
+                    if isinstance(meta, dict):
+                        metadata_rows.append(
+                            {
+                                "Код": code,
+                                "Назва": meta.get("longname", ""),
+                                "Одиниця": meta.get("units", ""),
+                            }
+                        )
+                if metadata_rows:
+                    st.dataframe(
+                        pd.DataFrame(metadata_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-        st.download_button(
-            "Завантажити CSV",
-            data=dataframe_to_csv_bytes(nasa_df),
-            file_name="nasa_power_hourly.csv",
-            mime="text/csv",
-            use_container_width=True,
+        d1, d2 = st.columns(2)
+
+        with d1:
+            st.download_button(
+                "Завантажити погодинні дані NASA POWER",
+                data=dataframe_to_csv_bytes(nasa_hourly),
+                file_name="nasa_power_hourly.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_nasa_hourly",
+            )
+
+        with d2:
+            st.download_button(
+                "Завантажити часовий ряд моделі",
+                data=dataframe_to_csv_bytes(weather_model),
+                file_name=(
+                    f"weather_model_{model_step_minutes}min.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_weather_model",
+            )
+
+# ---------------------------------------------------------------------
+# 4. СТАН ЗОВНІШНЬОГО ВОЛОГОГО ПОВІТРЯ
+# ---------------------------------------------------------------------
+with tab_psychro:
+    st.subheader("Етап 9. Стан зовнішнього вологого повітря")
+
+    st.write(
+        "Розрахунок виконується для кожного часового інтервалу моделі "
+        "за температурою зовнішнього повітря `T2M`, відносною вологістю "
+        "`RH2M` та атмосферним тиском `PS`."
+    )
+
+    st.markdown(
+        """
+        Визначаються:
+        - тиск насиченої водяної пари;
+        - парціальний тиск водяної пари;
+        - вологовміст повітря;
+        - ентальпія вологого повітря;
+        - температура точки роси;
+        - густина вологого повітря;
+        - питомий об'єм на 1 кг сухого повітря.
+        """
+    )
+
+    if "weather_model" not in st.session_state:
+        st.warning(
+            "Спочатку відкрийте вкладку «Погодні дані NASA POWER» "
+            "та натисніть «Завантажити NASA POWER і сформувати ряд моделі»."
         )
+    else:
+        weather_model = st.session_state["weather_model"]
+
+        try:
+            psychro_df = calculate_psychrometric_state(
+                weather_model
+            )
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["psychro_model"] = psychro_df
+
+            psychro_summary = summarize_psychrometrics(
+                psychro_df
+            )
+
+            st.markdown("#### Підсумкові психрометричні показники")
+            st.dataframe(
+                psychro_summary.style.format(
+                    {"Значення": "{:.4f}"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            p1, p2, p3, p4 = st.columns(4)
+
+            p1.metric(
+                "Середній вологовміст",
+                (
+                    f"{psychro_df['humidity_ratio_g_kg'].mean():.2f} "
+                    "г/кг с.п."
+                ),
+            )
+
+            p2.metric(
+                "Середня ентальпія",
+                (
+                    f"{psychro_df['enthalpy_kj_kg_da'].mean():.2f} "
+                    "кДж/кг с.п."
+                ),
+            )
+
+            p3.metric(
+                "Мін. точка роси",
+                f"{psychro_df['dew_point_calc_c'].min():.2f} °C",
+            )
+
+            p4.metric(
+                "Макс. точка роси",
+                f"{psychro_df['dew_point_calc_c'].max():.2f} °C",
+            )
+
+            st.markdown("#### Часовий ряд стану зовнішнього повітря")
+
+            display_columns = [
+                "operating_mode",
+                "T2M",
+                "RH2M",
+                "PS",
+                "p_ws_kpa",
+                "p_v_kpa",
+                "humidity_ratio_g_kg",
+                "enthalpy_kj_kg_da",
+                "dew_point_calc_c",
+                "T2MDEW",
+                "dew_point_error_c",
+                "moist_air_density_kg_m3",
+                "specific_volume_m3_kg_da",
+            ]
+
+            existing_columns = [
+                column
+                for column in display_columns
+                if column in psychro_df.columns
+            ]
+
+            st.dataframe(
+                psychro_df[existing_columns],
+                use_container_width=True,
+            )
+
+            st.markdown("#### Вологовміст зовнішнього повітря")
+            st.line_chart(
+                psychro_df[["humidity_ratio_g_kg"]],
+                use_container_width=True,
+            )
+
+            st.markdown("#### Ентальпія зовнішнього вологого повітря")
+            st.line_chart(
+                psychro_df[["enthalpy_kj_kg_da"]],
+                use_container_width=True,
+            )
+
+            st.markdown("#### Точка роси: розрахунок і NASA POWER")
+
+            dew_columns = ["dew_point_calc_c"]
+            if "T2MDEW" in psychro_df.columns:
+                dew_columns.append("T2MDEW")
+
+            st.line_chart(
+                psychro_df[dew_columns],
+                use_container_width=True,
+            )
+
+            if "dew_point_abs_error_c" in psychro_df.columns:
+                mean_dew_error = (
+                    psychro_df["dew_point_abs_error_c"].mean()
+                )
+                max_dew_error = (
+                    psychro_df["dew_point_abs_error_c"].max()
+                )
+
+                st.info(
+                    "Контрольний розрахунок точки роси: "
+                    f"середнє абсолютне відхилення від `T2MDEW` NASA POWER "
+                    f"становить {mean_dew_error:.3f} °C, "
+                    f"максимальне — {max_dew_error:.3f} °C."
+                )
+
+            st.download_button(
+                "Завантажити часовий ряд із психрометричними параметрами",
+                data=dataframe_to_csv_bytes(psychro_df),
+                file_name="weather_psychrometrics.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_psychrometrics",
+            )
+
+            st.info(
+                "Наступний етап — пункт 10: визначення потрібної середньої "
+                "швидкості видалення води на основі маси води, яку необхідно "
+                "видалити, та сумарної тривалості активного денного сушіння."
+            )
