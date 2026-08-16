@@ -696,6 +696,120 @@ def summarize_psychrometrics(
         columns=["Показник", "Значення", "Одиниця"],
     )
 
+
+def calculate_required_moisture_removal_profile(
+    timeline: pd.DataFrame,
+    water_to_remove_kg: float,
+    dry_matter_kg: float,
+    initial_water_kg: float,
+    step_minutes: int,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """
+    Пункт 10. Цільова середня швидкість видалення води.
+
+    У денному режимі приймається постійна середня цільова швидкість,
+    у нічному режимі — нульова. Це не фактична кінетика сушіння.
+    """
+    if water_to_remove_kg <= 0:
+        raise ValueError("Маса води до видалення повинна бути > 0.")
+    if dry_matter_kg <= 0:
+        raise ValueError("Маса сухої речовини повинна бути > 0.")
+
+    result = timeline.copy()
+    active_mask = result["operating_mode"] == "Денний режим"
+    active_intervals = int(active_mask.sum())
+
+    if active_intervals == 0:
+        raise ValueError("У циклі немає денних інтервалів сушіння.")
+
+    active_hours = active_intervals * step_minutes / 60.0
+    avg_rate_kg_h = water_to_remove_kg / active_hours
+    water_per_interval_kg = avg_rate_kg_h * step_minutes / 60.0
+
+    result["required_moisture_removal_rate_kg_h"] = 0.0
+    result.loc[
+        active_mask, "required_moisture_removal_rate_kg_h"
+    ] = avg_rate_kg_h
+
+    result["target_water_removed_interval_kg"] = 0.0
+    result.loc[
+        active_mask, "target_water_removed_interval_kg"
+    ] = water_per_interval_kg
+
+    result["target_cumulative_water_removed_kg"] = (
+        result["target_water_removed_interval_kg"]
+        .cumsum()
+        .clip(upper=water_to_remove_kg)
+    )
+
+    final_water_kg = initial_water_kg - water_to_remove_kg
+
+    result["target_water_remaining_kg"] = (
+        initial_water_kg
+        - result["target_cumulative_water_removed_kg"]
+    ).clip(lower=final_water_kg)
+
+    result["target_product_mass_kg"] = (
+        dry_matter_kg + result["target_water_remaining_kg"]
+    )
+
+    result["target_product_moisture_wb_pct"] = (
+        result["target_water_remaining_kg"]
+        / result["target_product_mass_kg"]
+        * 100.0
+    )
+
+    result["target_product_moisture_db_kg_kg"] = (
+        result["target_water_remaining_kg"] / dry_matter_kg
+    )
+
+    summary = {
+        "active_intervals": active_intervals,
+        "active_hours": active_hours,
+        "average_required_rate_kg_h": avg_rate_kg_h,
+        "average_required_rate_g_h": avg_rate_kg_h * 1000.0,
+        "average_required_rate_g_min": avg_rate_kg_h * 1000.0 / 60.0,
+        "water_per_active_interval_kg": water_per_interval_kg,
+        "water_per_active_interval_g": water_per_interval_kg * 1000.0,
+    }
+
+    return result, summary
+
+
+def summarize_required_moisture_removal(
+    water_to_remove_kg: float,
+    step_minutes: int,
+    summary: dict[str, float],
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Показник": [
+                "Маса води, яку необхідно видалити",
+                "Сумарна тривалість активного сушіння",
+                "Середня потрібна швидкість видалення води",
+                "Середня потрібна швидкість видалення води",
+                "Середня потрібна швидкість видалення води",
+                f"Вода за один активний інтервал ({step_minutes} хв)",
+            ],
+            "Значення": [
+                water_to_remove_kg,
+                summary["active_hours"],
+                summary["average_required_rate_kg_h"],
+                summary["average_required_rate_g_h"],
+                summary["average_required_rate_g_min"],
+                summary["water_per_active_interval_g"],
+            ],
+            "Одиниця": [
+                "кг",
+                "год",
+                "кг/год",
+                "г/год",
+                "г/хв",
+                "г/інтервал",
+            ],
+        }
+    )
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -722,12 +836,13 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
         "3. Погодні дані NASA POWER",
         "4. Стан вологого повітря",
+        "5. Потрібна швидкість сушіння",
     ]
 )
 
@@ -1427,8 +1542,158 @@ with tab_psychro:
                 key="download_psychrometrics",
             )
 
-            st.info(
-                "Наступний етап — пункт 10: визначення потрібної середньої "
-                "швидкості видалення води на основі маси води, яку необхідно "
-                "видалити, та сумарної тривалості активного денного сушіння."
+# ---------------------------------------------------------------------
+# 5. ПОТРІБНА ШВИДКІСТЬ ВИДАЛЕННЯ ВОДИ
+# ---------------------------------------------------------------------
+with tab_removal:
+    st.subheader("Етап 10. Визначення потрібної швидкості видалення води")
+
+    st.info(
+        "Тут визначається цільова середня швидкість, необхідна для "
+        "видалення заданої маси води за сумарний час активного денного "
+        "сушіння. Це ще не фактична кінетика сушіння."
+    )
+
+    current_product = products.loc[
+        products["product_name_uk"] == selected_name
+    ].iloc[0]
+
+    current_balance = calculate_mass_balance(
+        initial_mass_kg,
+        float(current_product["initial_moisture_pct"]),
+        float(current_product["final_moisture_pct"]),
+    )
+
+    removal_start = datetime.combine(
+        process_start_date,
+        process_start_time,
+        tzinfo=ZoneInfo("UTC"),
+    )
+
+    try:
+        removal_timeline = build_process_timeline(
+            start_local=removal_start,
+            duration_hours=process_duration_hours,
+            step_minutes=model_step_minutes,
+            day_start=day_start_time,
+            day_end=day_end_time,
+        )
+
+        removal_profile, removal_summary = (
+            calculate_required_moisture_removal_profile(
+                timeline=removal_timeline,
+                water_to_remove_kg=current_balance["water_to_remove_kg"],
+                dry_matter_kg=current_balance["dry_matter_kg"],
+                initial_water_kg=current_balance["initial_water_kg"],
+                step_minutes=model_step_minutes,
             )
+        )
+    except Exception as exc:
+        st.error(str(exc))
+    else:
+        st.session_state["required_moisture_removal_profile"] = (
+            removal_profile
+        )
+
+        r1, r2, r3, r4 = st.columns(4)
+
+        r1.metric(
+            "Вода до видалення",
+            f"{current_balance['water_to_remove_kg']:.3f} кг",
+        )
+        r2.metric(
+            "Активне сушіння",
+            f"{removal_summary['active_hours']:.1f} год",
+        )
+        r3.metric(
+            "Потрібна середня швидкість",
+            f"{removal_summary['average_required_rate_kg_h']:.4f} кг/год",
+        )
+        r4.metric(
+            f"За {model_step_minutes} хв",
+            f"{removal_summary['water_per_active_interval_g']:.2f} г",
+        )
+
+        st.markdown("#### Розрахункова залежність")
+
+        st.latex(
+            r"\overline{\dot m}_{\mathrm{вид}}"
+            r"=\frac{m_{\mathrm{вид}}}{\tau_{\mathrm{актив}}}"
+        )
+
+        st.latex(
+            rf"\overline{{\dot m}}_{{\mathrm{{вид}}}}"
+            rf"=\frac{{{current_balance['water_to_remove_kg']:.4f}}}"
+            rf"{{{removal_summary['active_hours']:.2f}}}"
+            rf"={removal_summary['average_required_rate_kg_h']:.5f}"
+            rf"\ \mathrm{{кг/год}}"
+        )
+
+        summary_table = summarize_required_moisture_removal(
+            water_to_remove_kg=current_balance["water_to_remove_kg"],
+            step_minutes=model_step_minutes,
+            summary=removal_summary,
+        )
+
+        st.dataframe(
+            summary_table.style.format({"Значення": "{:.5f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Цільова часова траєкторія")
+
+        columns = [
+            "operating_mode",
+            "elapsed_hours",
+            "required_moisture_removal_rate_kg_h",
+            "target_water_removed_interval_kg",
+            "target_cumulative_water_removed_kg",
+            "target_water_remaining_kg",
+            "target_product_mass_kg",
+            "target_product_moisture_wb_pct",
+            "target_product_moisture_db_kg_kg",
+        ]
+
+        st.dataframe(
+            removal_profile[columns],
+            use_container_width=True,
+        )
+
+        st.markdown("#### Цільова швидкість видалення води")
+        st.line_chart(
+            removal_profile[
+                ["required_moisture_removal_rate_kg_h"]
+            ],
+            use_container_width=True,
+        )
+
+        st.markdown("#### Цільове зниження вологості продукту")
+        st.line_chart(
+            removal_profile[
+                ["target_product_moisture_wb_pct"]
+            ],
+            use_container_width=True,
+        )
+
+        st.warning(
+            "Ця траєкторія є цільовою: прийнято рівномірне видалення "
+            "води у денному режимі та нульове — у нічному. Реальна "
+            "швидкість сушіння надалі повинна визначатися кінетичною "
+            "моделлю або експериментально."
+        )
+
+        st.download_button(
+            "Завантажити цільовий профіль видалення води",
+            data=dataframe_to_csv_bytes(removal_profile),
+            file_name="required_moisture_removal_profile.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_required_moisture_removal",
+        )
+
+        st.info(
+            "Наступний етап — пункт 11: розрахунок витрати сушильного "
+            "агента за зміною вологовмісту повітря між входом і виходом "
+            "сушильної камери."
+        )
