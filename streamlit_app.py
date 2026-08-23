@@ -810,6 +810,160 @@ def summarize_required_moisture_removal(
         }
     )
 
+
+def calculate_dryer_geometry(
+    product_mass_kg: float,
+    chamber_length_m: float,
+    chamber_width_m: float,
+    chamber_height_m: float,
+    tray_count: int,
+    tray_length_m: float,
+    tray_width_m: float,
+    layer_thickness_m: float,
+    tray_pitch_m: float,
+    airflow_direction: str,
+    reference_bulk_density_kg_m3: float | None = None,
+) -> dict[str, float | str | None]:
+    """
+    Пункт 11. Геометричні параметри сушильної камери та шару продукту.
+
+    Розрахунок не задає витрату повітря і не використовує припущення
+    щодо стану повітря на виході. Формуються лише геометричні та
+    масо-геометричні характеристики, потрібні для наступних етапів.
+    """
+    positive_values = {
+        "Початкова маса продукту": product_mass_kg,
+        "Довжина камери": chamber_length_m,
+        "Ширина камери": chamber_width_m,
+        "Висота камери": chamber_height_m,
+        "Довжина лотка": tray_length_m,
+        "Ширина лотка": tray_width_m,
+        "Товщина шару": layer_thickness_m,
+        "Крок між ярусами": tray_pitch_m,
+    }
+
+    for name, value in positive_values.items():
+        if value <= 0:
+            raise ValueError(f"{name} має бути більше нуля.")
+
+    if tray_count < 1:
+        raise ValueError("Кількість лотків має бути не меншою за 1.")
+
+    chamber_volume_m3 = (
+        chamber_length_m
+        * chamber_width_m
+        * chamber_height_m
+    )
+
+    tray_area_m2 = tray_length_m * tray_width_m
+    total_drying_area_m2 = tray_count * tray_area_m2
+
+    product_layer_volume_m3 = (
+        total_drying_area_m2
+        * layer_thickness_m
+    )
+
+    specific_loading_kg_m2 = (
+        product_mass_kg / total_drying_area_m2
+    )
+
+    calculated_bulk_loading_kg_m3 = (
+        product_mass_kg / product_layer_volume_m3
+    )
+
+    chamber_fill_fraction_pct = (
+        product_layer_volume_m3
+        / chamber_volume_m3
+        * 100.0
+    )
+
+    if airflow_direction == "Уздовж довжини камери":
+        gross_flow_area_m2 = (
+            chamber_width_m * chamber_height_m
+        )
+        flow_path_length_m = chamber_length_m
+
+    elif airflow_direction == "Уздовж ширини камери":
+        gross_flow_area_m2 = (
+            chamber_length_m * chamber_height_m
+        )
+        flow_path_length_m = chamber_width_m
+
+    elif airflow_direction == "Вертикально":
+        gross_flow_area_m2 = (
+            chamber_length_m * chamber_width_m
+        )
+        flow_path_length_m = chamber_height_m
+
+    else:
+        raise ValueError("Невідомий напрям основного потоку повітря.")
+
+    # Геометрична перевірка розміщення лотка у плані.
+    tray_fits_in_plan = (
+        tray_length_m <= chamber_length_m
+        and tray_width_m <= chamber_width_m
+    )
+
+    # Спрощена перевірка вертикального розміщення ярусів.
+    # Товщина самих лотків і крайові зазори тут ще не враховуються.
+    required_stack_height_m = (
+        (tray_count - 1) * tray_pitch_m
+        + layer_thickness_m
+    )
+    stack_fits_height = (
+        required_stack_height_m <= chamber_height_m
+    )
+
+    required_layer_thickness_from_reference_m = None
+    bulk_density_difference_pct = None
+
+    if (
+        reference_bulk_density_kg_m3 is not None
+        and reference_bulk_density_kg_m3 > 0
+    ):
+        required_layer_thickness_from_reference_m = (
+            product_mass_kg
+            / (
+                reference_bulk_density_kg_m3
+                * total_drying_area_m2
+            )
+        )
+
+        bulk_density_difference_pct = (
+            (
+                calculated_bulk_loading_kg_m3
+                - reference_bulk_density_kg_m3
+            )
+            / reference_bulk_density_kg_m3
+            * 100.0
+        )
+
+    return {
+        "chamber_volume_m3": chamber_volume_m3,
+        "tray_area_m2": tray_area_m2,
+        "total_drying_area_m2": total_drying_area_m2,
+        "product_layer_volume_m3": product_layer_volume_m3,
+        "specific_loading_kg_m2": specific_loading_kg_m2,
+        "calculated_bulk_loading_kg_m3": (
+            calculated_bulk_loading_kg_m3
+        ),
+        "chamber_fill_fraction_pct": chamber_fill_fraction_pct,
+        "gross_flow_area_m2": gross_flow_area_m2,
+        "flow_path_length_m": flow_path_length_m,
+        "required_stack_height_m": required_stack_height_m,
+        "tray_fits_in_plan": tray_fits_in_plan,
+        "stack_fits_height": stack_fits_height,
+        "reference_bulk_density_kg_m3": (
+            reference_bulk_density_kg_m3
+        ),
+        "required_layer_thickness_from_reference_m": (
+            required_layer_thickness_from_reference_m
+        ),
+        "bulk_density_difference_pct": (
+            bulk_density_difference_pct
+        ),
+    }
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -836,13 +990,14 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
         "3. Погодні дані NASA POWER",
         "4. Стан вологого повітря",
         "5. Потрібна швидкість сушіння",
+        "6. Геометрія камери і шару",
     ]
 )
 
@@ -1693,7 +1848,336 @@ with tab_removal:
         )
 
         st.info(
-            "Наступний етап — пункт 11: розрахунок витрати сушильного "
-            "агента за зміною вологовмісту повітря між входом і виходом "
-            "сушильної камери."
+            "Наступний етап — пункт 11: задання геометричних параметрів "
+            "сушильної камери та параметрів шару продукту."
+        )
+
+# ---------------------------------------------------------------------
+# 6. ГЕОМЕТРІЯ СУШИЛЬНОЇ КАМЕРИ І ШАРУ ПРОДУКТУ
+# ---------------------------------------------------------------------
+with tab_geometry:
+    st.subheader(
+        "Етап 11. Геометричні параметри сушильної камери "
+        "та параметри шару продукту"
+    )
+
+    st.info(
+        "На цьому етапі задається лише геометрія установки і шару "
+        "продукту. Витрата сушильного агента, стан повітря на виході "
+        "та фактична швидкість сушіння поки не визначаються."
+    )
+
+    st.markdown("#### Геометрія сушильної камери")
+
+    g1, g2, g3 = st.columns(3)
+
+    with g1:
+        chamber_length_m = st.number_input(
+            "Внутрішня довжина камери, м",
+            min_value=0.10,
+            value=1.50,
+            step=0.05,
+            format="%.3f",
+            key="chamber_length_m",
+        )
+
+    with g2:
+        chamber_width_m = st.number_input(
+            "Внутрішня ширина камери, м",
+            min_value=0.10,
+            value=0.80,
+            step=0.05,
+            format="%.3f",
+            key="chamber_width_m",
+        )
+
+    with g3:
+        chamber_height_m = st.number_input(
+            "Внутрішня висота камери, м",
+            min_value=0.10,
+            value=1.50,
+            step=0.05,
+            format="%.3f",
+            key="chamber_height_m",
+        )
+
+    airflow_direction = st.selectbox(
+        "Напрям основного потоку сушильного агента",
+        options=[
+            "Уздовж довжини камери",
+            "Уздовж ширини камери",
+            "Вертикально",
+        ],
+        index=0,
+        key="airflow_direction",
+    )
+
+    st.markdown("#### Лотки та шар продукту")
+
+    t1, t2, t3 = st.columns(3)
+
+    with t1:
+        tray_count = st.number_input(
+            "Кількість лотків (ярусів)",
+            min_value=1,
+            value=5,
+            step=1,
+            key="tray_count",
+        )
+
+    with t2:
+        tray_length_m = st.number_input(
+            "Корисна довжина одного лотка, м",
+            min_value=0.05,
+            value=1.20,
+            step=0.05,
+            format="%.3f",
+            key="tray_length_m",
+        )
+
+    with t3:
+        tray_width_m = st.number_input(
+            "Корисна ширина одного лотка, м",
+            min_value=0.05,
+            value=0.60,
+            step=0.05,
+            format="%.3f",
+            key="tray_width_m",
+        )
+
+    # Якщо в Google Sheets для вибраного продукту є рекомендована
+    # товщина шару, використовуємо її лише як початкове значення поля.
+    sheet_layer_thickness = None
+    if "layer_thickness_m" in current_product.index:
+        try:
+            value = float(current_product["layer_thickness_m"])
+            if pd.notna(value) and value > 0:
+                sheet_layer_thickness = value
+        except (TypeError, ValueError):
+            sheet_layer_thickness = None
+
+    default_layer_thickness_m = (
+        sheet_layer_thickness
+        if sheet_layer_thickness is not None
+        else 0.030
+    )
+
+    l1, l2 = st.columns(2)
+
+    with l1:
+        layer_thickness_m = st.number_input(
+            "Товщина шару продукту на лотку, м",
+            min_value=0.001,
+            value=float(default_layer_thickness_m),
+            step=0.005,
+            format="%.3f",
+            key="layer_thickness_geometry_m",
+        )
+
+    with l2:
+        tray_pitch_m = st.number_input(
+            "Вертикальний крок між ярусами, м",
+            min_value=0.01,
+            value=0.20,
+            step=0.01,
+            format="%.3f",
+            key="tray_pitch_m",
+        )
+
+    reference_bulk_density = None
+
+    if "bulk_density_kg_m3" in current_product.index:
+        try:
+            bulk_value = float(
+                current_product["bulk_density_kg_m3"]
+            )
+            if pd.notna(bulk_value) and bulk_value > 0:
+                reference_bulk_density = bulk_value
+        except (TypeError, ValueError):
+            reference_bulk_density = None
+
+    if reference_bulk_density is None:
+        st.caption(
+            "Довідкова насипна густина для вибраного продукту "
+            "у Google Sheets не задана. Геометрія буде розрахована "
+            "без порівняння з довідковою насипною густиною."
+        )
+    else:
+        st.write(
+            "Довідкова насипна густина з Google Sheets: "
+            f"**{reference_bulk_density:.1f} кг/м³**."
+        )
+
+    try:
+        geometry = calculate_dryer_geometry(
+            product_mass_kg=float(initial_mass_kg),
+            chamber_length_m=float(chamber_length_m),
+            chamber_width_m=float(chamber_width_m),
+            chamber_height_m=float(chamber_height_m),
+            tray_count=int(tray_count),
+            tray_length_m=float(tray_length_m),
+            tray_width_m=float(tray_width_m),
+            layer_thickness_m=float(layer_thickness_m),
+            tray_pitch_m=float(tray_pitch_m),
+            airflow_direction=airflow_direction,
+            reference_bulk_density_kg_m3=(
+                reference_bulk_density
+            ),
+        )
+    except Exception as exc:
+        st.error(str(exc))
+    else:
+        st.session_state["dryer_geometry"] = geometry
+
+        st.markdown("#### Розраховані геометричні параметри")
+
+        m1, m2, m3, m4 = st.columns(4)
+
+        m1.metric(
+            "Об'єм камери",
+            f"{geometry['chamber_volume_m3']:.3f} м³",
+        )
+
+        m2.metric(
+            "Сумарна площа сушіння",
+            f"{geometry['total_drying_area_m2']:.3f} м²",
+        )
+
+        m3.metric(
+            "Питоме завантаження",
+            f"{geometry['specific_loading_kg_m2']:.2f} кг/м²",
+        )
+
+        m4.metric(
+            "Геометрична площа перерізу потоку",
+            f"{geometry['gross_flow_area_m2']:.3f} м²",
+        )
+
+        geometry_table = pd.DataFrame(
+            {
+                "Параметр": [
+                    "Об'єм сушильної камери",
+                    "Площа одного лотка",
+                    "Сумарна корисна площа сушіння",
+                    "Сумарний геометричний об'єм шару продукту",
+                    "Питоме завантаження площі сушіння",
+                    "Розрахункова об'ємна щільність завантаження",
+                    "Частка об'єму шару від об'єму камери",
+                    "Геометрична площа поперечного перерізу потоку",
+                    "Довжина шляху основного потоку",
+                    "Орієнтовна висота пакета ярусів",
+                ],
+                "Значення": [
+                    geometry["chamber_volume_m3"],
+                    geometry["tray_area_m2"],
+                    geometry["total_drying_area_m2"],
+                    geometry["product_layer_volume_m3"],
+                    geometry["specific_loading_kg_m2"],
+                    geometry["calculated_bulk_loading_kg_m3"],
+                    geometry["chamber_fill_fraction_pct"],
+                    geometry["gross_flow_area_m2"],
+                    geometry["flow_path_length_m"],
+                    geometry["required_stack_height_m"],
+                ],
+                "Одиниця": [
+                    "м³",
+                    "м²",
+                    "м²",
+                    "м³",
+                    "кг/м²",
+                    "кг/м³",
+                    "%",
+                    "м²",
+                    "м",
+                    "м",
+                ],
+            }
+        )
+
+        st.dataframe(
+            geometry_table.style.format(
+                {"Значення": "{:.4f}"}
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if not geometry["tray_fits_in_plan"]:
+            st.error(
+                "Корисні розміри лотка перевищують внутрішні "
+                "розміри камери у плані."
+            )
+        else:
+            st.success(
+                "Корисні розміри лотка не перевищують внутрішні "
+                "розміри камери у плані."
+            )
+
+        if not geometry["stack_fits_height"]:
+            st.warning(
+                "За заданим кроком між ярусами пакет лотків "
+                "перевищує внутрішню висоту камери. Перевірте "
+                "кількість ярусів або їх крок."
+            )
+
+        if (
+            geometry[
+                "required_layer_thickness_from_reference_m"
+            ]
+            is not None
+        ):
+            st.markdown(
+                "#### Перевірка за довідковою насипною густиною"
+            )
+
+            st.write(
+                "Товщина шару, яка відповідала б заданій масі, "
+                "сумарній площі сушіння та довідковій насипній "
+                "густині:"
+            )
+
+            st.latex(
+                r"\delta_{\mathrm{розр}}"
+                r"=\frac{m_0}{\rho_{\mathrm{нас}}A_{\mathrm{суш}}}"
+            )
+
+            st.metric(
+                "Розрахункова товщина шару за ρнас",
+                (
+                    f"{geometry['required_layer_thickness_from_reference_m']:.4f} "
+                    "м"
+                ),
+            )
+
+            st.caption(
+                "Це контроль узгодженості введених геометричних "
+                "параметрів, а не автоматична заміна введеної "
+                "користувачем товщини шару."
+            )
+
+        st.markdown("#### Основні геометричні залежності")
+
+        st.latex(
+            r"V_{\mathrm{кам}}=L_{\mathrm{кам}}"
+            r"B_{\mathrm{кам}}H_{\mathrm{кам}}"
+        )
+
+        st.latex(
+            r"A_{\mathrm{суш}}=n_{\mathrm{лот}}"
+            r"L_{\mathrm{лот}}B_{\mathrm{лот}}"
+        )
+
+        st.latex(
+            r"V_{\mathrm{ш}}=A_{\mathrm{суш}}\delta_{\mathrm{ш}}"
+        )
+
+        st.latex(
+            r"q_A=\frac{m_0}{A_{\mathrm{суш}}}"
+        )
+
+        st.info(
+            "Наступний етап — пункт 12: вибір і обґрунтування "
+            "кінетичної моделі сушіння продукту. На цьому етапі "
+            "вперше з'явиться залежність фактичної швидкості "
+            "видалення вологи від стану продукту та сушильного агента."
         )
