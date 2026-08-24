@@ -1209,27 +1209,49 @@ def page_k_wheat_pionier(
     RH : %
     v  : m/s
 
-    The source reports k in min^-1 and n = 0.784.
-    Valid experimental domain:
+    Experimental Page domain reported by the source:
         T = 10...50 °C
         RH = 20...60 %
         v = 0.15...1.00 m/s
+
+    Policy used here:
+    - k is "validated" when all three variables are within the
+      experimental Page domain;
+    - if T and v are within the source range but RH is outside
+      20...60 %, the same correlation is evaluated and explicitly
+      marked as "extrapolated_rh";
+    - if T or v are outside the source range, k is not calculated.
+
+    This preserves the real calculated RH instead of artificially
+    clipping it to 20 or 60 %.
     """
     import numpy as np
 
     t = pd.Series(temperature_c, dtype="float64")
     rh = pd.Series(relative_humidity_pct, dtype="float64")
 
-    if not (0.15 <= air_velocity_m_s <= 1.00):
-        raise ValueError(
-            "Швидкість сушильного агента для узагальненої "
-            "моделі Page має бути в межах 0,15–1,00 м/с."
-        )
-
-    valid = (
+    tv_valid = (
         t.between(10.0, 50.0, inclusive="both")
+        & (0.15 <= float(air_velocity_m_s) <= 1.00)
+    )
+
+    rh_physical = (
+        (rh > 0.0)
+        & (rh < 100.0)
+    )
+
+    validated = (
+        tv_valid
         & rh.between(20.0, 60.0, inclusive="both")
     )
+
+    extrapolated_rh = (
+        tv_valid
+        & rh_physical
+        & ~rh.between(20.0, 60.0, inclusive="both")
+    )
+
+    calculable = validated | extrapolated_rh
 
     k = pd.Series(
         np.nan,
@@ -1237,33 +1259,77 @@ def page_k_wheat_pionier(
         dtype="float64",
     )
 
-    k.loc[valid] = (
+    k.loc[calculable] = (
         2.8e-3
-        * np.exp(0.059 * t.loc[valid])
-        * rh.loc[valid] ** (-0.139)
+        * np.exp(0.059 * t.loc[calculable])
+        * rh.loc[calculable] ** (-0.139)
         * float(air_velocity_m_s) ** 0.025
     )
+
+    # Diagnostic comparison only:
+    # what k would be if RH were limited to the nearest validated
+    # Page boundary (20 or 60 %). This is NOT used as the model input.
+    rh_clipped = rh.clip(lower=20.0, upper=60.0)
+
+    k_rh_clipped = pd.Series(
+        np.nan,
+        index=t.index,
+        dtype="float64",
+    )
+
+    clipped_calculable = tv_valid & rh_physical
+
+    k_rh_clipped.loc[clipped_calculable] = (
+        2.8e-3
+        * np.exp(0.059 * t.loc[clipped_calculable])
+        * rh_clipped.loc[clipped_calculable] ** (-0.139)
+        * float(air_velocity_m_s) ** 0.025
+    )
+
+    k_difference_pct = (
+        (k - k_rh_clipped)
+        / k_rh_clipped
+        * 100.0
+    )
+
+    status = pd.Series(
+        "outside_model_domain",
+        index=t.index,
+        dtype="object",
+    )
+    status.loc[validated] = "validated"
+    status.loc[extrapolated_rh] = "extrapolated_rh"
 
     return pd.DataFrame(
         {
             "page_k_min_inv": k,
             "page_n": 0.784,
-            "page_validity_ok": valid,
+            "page_status": status,
+            "page_validity_ok": validated,
+            "page_extrapolated_rh": extrapolated_rh,
+            "page_rh_clipped_for_check_pct": rh_clipped,
+            "page_k_rh_clipped_check_min_inv": k_rh_clipped,
+            "page_k_extrapolation_difference_pct": k_difference_pct,
         },
         index=t.index,
     )
-
 
 def prepare_heat_mass_transfer_inputs(
     equilibrium_profile: pd.DataFrame,
     air_velocity_m_s: float,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """
-    Stage 14: prepares the time-dependent quantities that are already
-    known for the coupled heat-and-mass-transfer system.
+    Stage 14: prepares time-dependent quantities for the coupled
+    heat-and-mass-transfer system.
 
-    No outlet-air state, air mass flow, convective coefficient,
-    porosity or product heat capacity are assumed here.
+    Page:
+    - validated: RH=20...60 %, T=10...50 °C, v=0.15...1.00 m/s;
+    - extrapolated_rh: T and v are inside the source range, but RH
+      is outside 20...60 %. k is calculated and clearly flagged;
+    - outside_model_domain: T or v is outside the source range,
+      or RH is nonphysical.
+
+    Modified Oswin validity remains an independent check.
     """
     required = {
         "operating_mode",
@@ -1288,45 +1354,102 @@ def prepare_heat_mass_transfer_inputs(
         air_velocity_m_s=air_velocity_m_s,
     )
 
-    result["air_velocity_m_s"] = float(air_velocity_m_s)
-    result["page_k_min_inv"] = page["page_k_min_inv"]
-    result["page_n"] = page["page_n"]
+    for col in page.columns:
+        result[col] = page[col]
 
-    result["page_validity_ok"] = (
-        page["page_validity_ok"]
-        & result["oswin_validity_ok"].fillna(False)
-    )
+    result["air_velocity_m_s"] = float(air_velocity_m_s)
+
+    # Combined status for later use of Page + Modified Oswin.
+    result["drying_model_status"] = "outside_model_domain"
+
+    oswin_ok = result["oswin_validity_ok"].fillna(False)
+    page_valid = result["page_status"] == "validated"
+    page_extrap = result["page_status"] == "extrapolated_rh"
+
+    result.loc[
+        oswin_ok & page_valid,
+        "drying_model_status",
+    ] = "validated"
+
+    result.loc[
+        oswin_ok & page_extrap,
+        "drying_model_status",
+    ] = "page_rh_extrapolation"
+
+    result.loc[
+        ~oswin_ok,
+        "drying_model_status",
+    ] = "outside_oswin_domain"
 
     day_mask = result["operating_mode"] == "Денний режим"
     active = result.loc[day_mask]
 
-    valid_active = active.loc[
-        active["page_validity_ok"]
+    validated_active = active.loc[
+        active["drying_model_status"] == "validated"
     ]
+
+    extrapolated_active = active.loc[
+        active["drying_model_status"] == "page_rh_extrapolation"
+    ]
+
+    usable_active = active.loc[
+        active["drying_model_status"].isin(
+            ["validated", "page_rh_extrapolation"]
+        )
+    ]
+
+    unusable_active = active.loc[
+        ~active["drying_model_status"].isin(
+            ["validated", "page_rh_extrapolation"]
+        )
+    ]
+
+    extrap_diff = pd.to_numeric(
+        extrapolated_active[
+            "page_k_extrapolation_difference_pct"
+        ],
+        errors="coerce",
+    ).abs()
 
     summary = {
         "air_velocity_m_s": float(air_velocity_m_s),
         "active_intervals": int(day_mask.sum()),
-        "valid_active_intervals": int(
-            valid_active.shape[0]
+        "validated_active_intervals": int(
+            validated_active.shape[0]
         ),
-        "invalid_active_intervals": int(
-            day_mask.sum() - valid_active.shape[0]
+        "extrapolated_active_intervals": int(
+            extrapolated_active.shape[0]
+        ),
+        "usable_active_intervals": int(
+            usable_active.shape[0]
+        ),
+        "unusable_active_intervals": int(
+            unusable_active.shape[0]
         ),
         "mean_k_min_inv": (
-            float(valid_active["page_k_min_inv"].mean())
-            if not valid_active.empty
+            float(usable_active["page_k_min_inv"].mean())
+            if not usable_active.empty
             else float("nan")
         ),
         "min_k_min_inv": (
-            float(valid_active["page_k_min_inv"].min())
-            if not valid_active.empty
+            float(usable_active["page_k_min_inv"].min())
+            if not usable_active.empty
             else float("nan")
         ),
         "max_k_min_inv": (
-            float(valid_active["page_k_min_inv"].max())
-            if not valid_active.empty
+            float(usable_active["page_k_min_inv"].max())
+            if not usable_active.empty
             else float("nan")
+        ),
+        "mean_abs_k_extrapolation_difference_pct": (
+            float(extrap_diff.mean())
+            if not extrap_diff.empty
+            else 0.0
+        ),
+        "max_abs_k_extrapolation_difference_pct": (
+            float(extrap_diff.max())
+            if not extrap_diff.empty
+            else 0.0
         ),
     }
 
@@ -2731,9 +2854,12 @@ with tab_kinetics:
     )
 
     st.warning(
-        "Узагальнену залежність k та значення n слід застосовувати "
-        "лише в межах експериментальної області Ramaj et al.: "
-        "T=10–50 °C, RH=20–60 %, v=0,15–1,00 м/с."
+        "Експериментально валідованою для Page є область "
+        "T=10–50 °C, RH=20–60 %, v=0,15–1,00 м/с. "
+        "У програмі значення k при виході RH за 20–60 % "
+        "може бути обчислено як екстраполяція, але такі "
+        "інтервали маркуються окремо і не вважаються "
+        "експериментально валідованими."
     )
 
 # ---------------------------------------------------------------------
@@ -3049,7 +3175,9 @@ with tab_heat_mass:
 
     st.write(
         "Для змінних умов коефіцієнт k визначається на кожному "
-        "часовому інтервалі за Ramaj et al. (2021):"
+        "часовому інтервалі за Ramaj et al. (2021). Інтервали "
+        "RH=20–60 % позначаються як валідовані; за межами цього "
+        "діапазону k може бути обчислено як явна екстраполяція:"
     )
 
     st.latex(
@@ -3126,7 +3254,7 @@ with tab_heat_mass:
             )
 
             c2.metric(
-                "Середнє k у валідних інтервалах",
+                "Середнє k",
                 (
                     f"{coupling_summary['mean_k_min_inv']:.5f} хв⁻¹"
                     if pd.notna(
@@ -3137,32 +3265,74 @@ with tab_heat_mass:
             )
 
             c3.metric(
-                "Валідні денні інтервали",
+                "Валідовані інтервали",
                 (
-                    f"{coupling_summary['valid_active_intervals']}"
+                    f"{coupling_summary['validated_active_intervals']}"
                     f"/{coupling_summary['active_intervals']}"
                 ),
             )
 
             c4.metric(
-                "n Page",
-                "0.784",
+                "Екстрапольовані за RH",
+                (
+                    f"{coupling_summary['extrapolated_active_intervals']}"
+                    f"/{coupling_summary['active_intervals']}"
+                ),
             )
 
             if coupling_summary[
-                "invalid_active_intervals"
+                "extrapolated_active_intervals"
             ] > 0:
                 st.warning(
-                    "Частина денних інтервалів лежить поза "
-                    "експериментальною областю узагальненої Page "
-                    "(T=10–50 °C, RH=20–60 %, v=0,15–1,00 м/с). "
-                    "Для них k не обчислюється. Це навмисно: "
-                    "екстраполяція без обґрунтування не виконується."
+                    "Для частини денних інтервалів RH лежить поза "
+                    "експериментальним діапазоном Page 20–60 %. "
+                    "Коефіцієнт k для них розраховується за тією самою "
+                    "кореляцією, але статус інтервалу встановлюється "
+                    "як «page_rh_extrapolation». Фактичне RH не "
+                    "замінюється штучно на 20 або 60 %."
                 )
-            else:
+
+                s1, s2 = st.columns(2)
+
+                s1.metric(
+                    "Середня |Δk| від граничного RH",
+                    (
+                        f"{coupling_summary['mean_abs_k_extrapolation_difference_pct']:.2f} %"
+                    ),
+                )
+
+                s2.metric(
+                    "Максимальна |Δk| від граничного RH",
+                    (
+                        f"{coupling_summary['max_abs_k_extrapolation_difference_pct']:.2f} %"
+                    ),
+                )
+
+                st.caption(
+                    "Δk тут є лише діагностикою: порівнюється k за "
+                    "фактичним RH з k, який був би отриманий при "
+                    "обмеженні RH найближчою межею валідованого "
+                    "діапазону (20 або 60 %). У сам розрахунок "
+                    "використовується k за фактичним RH."
+                )
+
+            if coupling_summary[
+                "unusable_active_intervals"
+            ] > 0:
+                st.error(
+                    "Є денні інтервали, для яких повна зв'язка "
+                    "Page + Modified Oswin непридатна: температура "
+                    "або швидкість лежить поза областю Page, або "
+                    "параметри лежать поза областю Modified Oswin."
+                )
+
+            if (
+                coupling_summary["extrapolated_active_intervals"] == 0
+                and coupling_summary["unusable_active_intervals"] == 0
+            ):
                 st.success(
                     "Усі активні денні інтервали лежать у межах "
-                    "експериментальної області узагальненої Page."
+                    "експериментальної області Page."
                 )
 
             stage14_columns = [
@@ -3173,7 +3343,13 @@ with tab_heat_mass:
                 "equilibrium_moisture_db_kg_kg",
                 "page_k_min_inv",
                 "page_n",
+                "page_status",
+                "drying_model_status",
                 "page_validity_ok",
+                "page_extrapolated_rh",
+                "page_rh_clipped_for_check_pct",
+                "page_k_rh_clipped_check_min_inv",
+                "page_k_extrapolation_difference_pct",
             ]
 
             existing_stage14_columns = [
