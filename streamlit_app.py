@@ -964,6 +964,235 @@ def calculate_dryer_geometry(
         ),
     }
 
+
+def relative_humidity_from_humidity_ratio(
+    temperature_c,
+    humidity_ratio_kg_kg,
+    pressure_kpa,
+):
+    """
+    Визначає відносну вологість повітря за температурою,
+    вологовмістом і повним тиском.
+
+    humidity_ratio_kg_kg: кг води / кг сухого повітря
+    pressure_kpa: кПа
+    """
+    import numpy as np
+
+    t = pd.Series(temperature_c, dtype="float64")
+    w = pd.Series(humidity_ratio_kg_kg, dtype="float64")
+    p = pd.Series(pressure_kpa, dtype="float64")
+
+    p_v = w * p / (0.621945 + w)
+    p_ws = saturation_vapor_pressure_kpa(t)
+
+    rh = 100.0 * p_v / p_ws
+    return rh.clip(lower=0.0, upper=100.0)
+
+
+def modified_oswin_wheat_pionier(
+    temperature_c,
+    relative_humidity_pct,
+) -> pd.DataFrame:
+    """
+    Рівноважний вологовміст пшениці Triticum aestivum L.,
+    cv. 'Pionier' за Modified Oswin model, Ramaj et al. (2021).
+
+    X_eq = (C1 + C2*T) *
+           [(RH/100)/(1 - RH/100)]^(1/C3)
+
+    Коефіцієнти:
+        C1 = 0.129
+        C2 = -6.460e-4 1/°C
+        C3 = 2.944
+
+    Діапазон експериментальної валідації:
+        10 <= T <= 50 °C
+        5.7 <= RH <= 86.8 %
+
+    X_eq: кг води / кг сухої речовини (dry basis).
+    """
+    import numpy as np
+
+    c1 = 0.129
+    c2 = -6.460e-4
+    c3 = 2.944
+
+    t = pd.Series(temperature_c, dtype="float64")
+    rh = pd.Series(relative_humidity_pct, dtype="float64")
+
+    valid = (
+        t.between(10.0, 50.0, inclusive="both")
+        & rh.between(5.7, 86.8, inclusive="both")
+    )
+
+    aw = rh / 100.0
+
+    x_eq = pd.Series(np.nan, index=t.index, dtype="float64")
+
+    safe = valid & (aw > 0.0) & (aw < 1.0)
+
+    x_eq.loc[safe] = (
+        (c1 + c2 * t.loc[safe])
+        * (
+            aw.loc[safe]
+            / (1.0 - aw.loc[safe])
+        ) ** (1.0 / c3)
+    )
+
+    w_eq_wb_pct = (
+        x_eq / (1.0 + x_eq) * 100.0
+    )
+
+    return pd.DataFrame(
+        {
+            "equilibrium_moisture_db_kg_kg": x_eq,
+            "equilibrium_moisture_wb_pct": w_eq_wb_pct,
+            "oswin_validity_ok": valid,
+        },
+        index=t.index,
+    )
+
+
+def calculate_equilibrium_moisture_profile(
+    psychro_df: pd.DataFrame,
+    drying_temperature_c: float,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """
+    Етап 13.
+
+    Для активного денного режиму:
+    1. Береться вологовміст зовнішнього повітря з етапу 9.
+    2. Повітря умовно нагрівається до заданої температури сушіння
+       без додавання/видалення вологи, тому d = const.
+    3. За d, p і T_суш визначається RH сушильного агента на вході.
+    4. За Modified Oswin визначається X_eq пшениці.
+
+    У нічному режимі X_eq тут не розраховується, оскільки нічний
+    температурний режим ще не сформований як режим активного сушіння.
+    """
+    import numpy as np
+
+    required = {
+        "humidity_ratio_kg_kg",
+        "PS",
+        "operating_mode",
+    }
+    missing = required - set(psychro_df.columns)
+
+    if missing:
+        raise ValueError(
+            "Для етапу 13 відсутні параметри з етапу 9: "
+            + ", ".join(sorted(missing))
+        )
+
+    result = psychro_df.copy()
+
+    day_mask = result["operating_mode"] == "Денний режим"
+
+    result["drying_air_temperature_c"] = np.nan
+    result.loc[
+        day_mask,
+        "drying_air_temperature_c",
+    ] = float(drying_temperature_c)
+
+    rh_drying = pd.Series(
+        np.nan,
+        index=result.index,
+        dtype="float64",
+    )
+
+    if day_mask.any():
+        rh_calc = relative_humidity_from_humidity_ratio(
+            temperature_c=pd.Series(
+                float(drying_temperature_c),
+                index=result.index[day_mask],
+            ),
+            humidity_ratio_kg_kg=result.loc[
+                day_mask,
+                "humidity_ratio_kg_kg",
+            ],
+            pressure_kpa=result.loc[
+                day_mask,
+                "PS",
+            ],
+        )
+        rh_calc.index = result.index[day_mask]
+        rh_drying.loc[day_mask] = rh_calc
+
+    result["drying_air_inlet_rh_pct"] = rh_drying
+
+    oswin = modified_oswin_wheat_pionier(
+        temperature_c=result["drying_air_temperature_c"],
+        relative_humidity_pct=result["drying_air_inlet_rh_pct"],
+    )
+
+    result["equilibrium_moisture_db_kg_kg"] = (
+        oswin["equilibrium_moisture_db_kg_kg"]
+    )
+    result["equilibrium_moisture_wb_pct"] = (
+        oswin["equilibrium_moisture_wb_pct"]
+    )
+    result["oswin_validity_ok"] = (
+        oswin["oswin_validity_ok"]
+    )
+
+    active = result.loc[day_mask].copy()
+    valid_active = active.loc[
+        active["oswin_validity_ok"]
+    ].copy()
+
+    invalid_active_count = int(
+        (~active["oswin_validity_ok"]).sum()
+    )
+
+    if valid_active.empty:
+        summary = {
+            "mean_drying_air_rh_pct": float("nan"),
+            "min_drying_air_rh_pct": float("nan"),
+            "max_drying_air_rh_pct": float("nan"),
+            "mean_xeq_db_kg_kg": float("nan"),
+            "min_xeq_db_kg_kg": float("nan"),
+            "max_xeq_db_kg_kg": float("nan"),
+            "mean_weq_wb_pct": float("nan"),
+            "invalid_active_intervals": invalid_active_count,
+        }
+    else:
+        summary = {
+            "mean_drying_air_rh_pct": float(
+                valid_active["drying_air_inlet_rh_pct"].mean()
+            ),
+            "min_drying_air_rh_pct": float(
+                valid_active["drying_air_inlet_rh_pct"].min()
+            ),
+            "max_drying_air_rh_pct": float(
+                valid_active["drying_air_inlet_rh_pct"].max()
+            ),
+            "mean_xeq_db_kg_kg": float(
+                valid_active[
+                    "equilibrium_moisture_db_kg_kg"
+                ].mean()
+            ),
+            "min_xeq_db_kg_kg": float(
+                valid_active[
+                    "equilibrium_moisture_db_kg_kg"
+                ].min()
+            ),
+            "max_xeq_db_kg_kg": float(
+                valid_active[
+                    "equilibrium_moisture_db_kg_kg"
+                ].max()
+            ),
+            "mean_weq_wb_pct": float(
+                valid_active[
+                    "equilibrium_moisture_wb_pct"
+                ].mean()
+            ),
+            "invalid_active_intervals": invalid_active_count,
+        }
+
+    return result, summary
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -990,7 +1219,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -999,6 +1228,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "5. Потрібна швидкість сушіння",
         "6. Геометрія камери і шару",
         "7. Кінетична модель сушіння",
+        "8. Рівноважна вологість",
     ]
 )
 
@@ -2349,8 +2579,221 @@ with tab_kinetics:
         "фізичного або експериментального обґрунтування."
     )
 
-    st.info(
-        "Наступний етап — пункт 13: визначення рівноважної "
-        "вологості пшениці для поточних температури та відносної "
-        "вологості сушильного агента."
+# ---------------------------------------------------------------------
+# 8. РІВНОВАЖНА ВОЛОГІСТЬ ПШЕНИЦІ
+# ---------------------------------------------------------------------
+with tab_equilibrium:
+    st.subheader(
+        "Етап 13. Визначення рівноважної вологості продукту"
     )
+
+    st.info(
+        "Для узгодженості з вибраною моделлю Page використовується "
+        "та сама експериментальна робота Ramaj et al. (2021). "
+        "Автори визначили рівноважний вологовміст пшениці сорту "
+        "Pionier експериментально та апроксимували його моделлю "
+        "Modified Oswin."
+    )
+
+    st.markdown("#### Модель Modified Oswin")
+
+    st.latex(
+        r"X_{\mathrm{eq}}="
+        r"\left(C_1+C_2T\right)"
+        r"\left("
+        r"\frac{\varphi/100}{1-\varphi/100}"
+        r"\right)^{1/C_3}"
+    )
+
+    st.markdown(
+        r"""
+де:
+
+- \(X_{\mathrm{eq}}\) — рівноважний вологовміст пшениці на сухій основі, кг води/кг сухої речовини;
+- \(T\) — температура сушильного агента, °C;
+- \(\varphi\) — відносна вологість сушильного агента, %;
+- \(C_1=0{,}129\);
+- \(C_2=-6{,}460\cdot10^{-4}\;^\circ\mathrm{C}^{-1}\);
+- \(C_3=2{,}944\).
+        """
+    )
+
+    st.caption(
+        "Діапазон експериментальної валідації Ramaj et al. (2021): "
+        "10–50 °C та 5,7–86,8 % RH. За межами цього діапазону "
+        "програма не виконує екстраполяцію."
+    )
+
+    if "psychro_model" not in st.session_state:
+        st.warning(
+            "Спочатку виконайте етап 9 у вкладці "
+            "«Стан вологого повітря», щоб сформувати часовий ряд "
+            "вологовмісту та атмосферного тиску."
+        )
+    else:
+        psychro_for_eq = st.session_state["psychro_model"]
+
+        drying_temp_for_eq = float(
+            product["target_drying_temp_c"]
+        )
+
+        try:
+            eq_profile, eq_summary = (
+                calculate_equilibrium_moisture_profile(
+                    psychro_df=psychro_for_eq,
+                    drying_temperature_c=drying_temp_for_eq,
+                )
+            )
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.session_state[
+                "equilibrium_moisture_profile"
+            ] = eq_profile
+
+            st.markdown(
+                "#### Стан сушильного агента перед контактом із продуктом"
+            )
+
+            st.write(
+                "У денному режимі повітря приводиться до заданої "
+                f"температури сушіння **{drying_temp_for_eq:.1f} °C**. "
+                "При чутливому нагріванні без додавання вологи "
+                "вологовміст повітря не змінюється:"
+            )
+
+            st.latex(
+                r"d_{\mathrm{після\ нагр}}="
+                r"d_{\mathrm{зовн}}"
+            )
+
+            st.write(
+                "Тому відносна вологість після нагрівання "
+                "визначається заново за незмінного вологовмісту "
+                "та поточного атмосферного тиску."
+            )
+
+            e1, e2, e3, e4 = st.columns(4)
+
+            e1.metric(
+                "Середня RH після нагрівання",
+                (
+                    f"{eq_summary['mean_drying_air_rh_pct']:.1f} %"
+                    if pd.notna(
+                        eq_summary["mean_drying_air_rh_pct"]
+                    )
+                    else "—"
+                ),
+            )
+
+            e2.metric(
+                "Середній Xeq",
+                (
+                    f"{eq_summary['mean_xeq_db_kg_kg']:.4f} кг/кг с.р."
+                    if pd.notna(
+                        eq_summary["mean_xeq_db_kg_kg"]
+                    )
+                    else "—"
+                ),
+            )
+
+            e3.metric(
+                "Середня рівноважна вологість",
+                (
+                    f"{eq_summary['mean_weq_wb_pct']:.2f} % w.b."
+                    if pd.notna(
+                        eq_summary["mean_weq_wb_pct"]
+                    )
+                    else "—"
+                ),
+            )
+
+            e4.metric(
+                "Інтервали поза областю моделі",
+                str(eq_summary["invalid_active_intervals"]),
+            )
+
+            if eq_summary["invalid_active_intervals"] > 0:
+                st.warning(
+                    "Для частини активних інтервалів температура "
+                    "або RH сушильного агента лежить поза "
+                    "експериментальним діапазоном Modified Oswin. "
+                    "Для цих інтервалів Xeq залишено порожнім, "
+                    "щоб не виконувати необґрунтовану екстраполяцію."
+                )
+            else:
+                st.success(
+                    "Усі активні денні інтервали лежать у межах "
+                    "експериментальної області Modified Oswin."
+                )
+
+            st.markdown("#### Часовий ряд")
+
+            eq_columns = [
+                "operating_mode",
+                "T2M",
+                "RH2M",
+                "humidity_ratio_g_kg",
+                "PS",
+                "drying_air_temperature_c",
+                "drying_air_inlet_rh_pct",
+                "equilibrium_moisture_db_kg_kg",
+                "equilibrium_moisture_wb_pct",
+                "oswin_validity_ok",
+            ]
+
+            existing_eq_columns = [
+                col
+                for col in eq_columns
+                if col in eq_profile.columns
+            ]
+
+            st.dataframe(
+                eq_profile[existing_eq_columns],
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Рівноважний вологовміст на сухій основі"
+            )
+
+            st.line_chart(
+                eq_profile[
+                    ["equilibrium_moisture_db_kg_kg"]
+                ],
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Рівноважна вологість на вологій основі"
+            )
+
+            st.line_chart(
+                eq_profile[
+                    ["equilibrium_moisture_wb_pct"]
+                ],
+                use_container_width=True,
+            )
+
+            st.warning(
+                "Xeq не є фактичною вологістю зерна. Це рівноважне "
+                "значення, до якого зерно прагне за тривалого контакту "
+                "з повітрям за відповідних T і RH. Фактична зміна "
+                "вологовмісту визначатиметься кінетичною моделлю Page."
+            )
+
+            st.download_button(
+                "Завантажити профіль рівноважної вологості",
+                data=dataframe_to_csv_bytes(eq_profile),
+                file_name="equilibrium_moisture_profile.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_equilibrium_moisture",
+            )
+
+            st.info(
+                "Наступний етап — використати Page разом із Xeq "
+                "та залежністю коефіцієнта k від температури, RH "
+                "і швидкості сушильного агента, після чого сформувати "
+                "динамічне рівняння зміни вологовмісту продукту."
+            )
