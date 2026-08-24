@@ -1193,6 +1193,145 @@ def calculate_equilibrium_moisture_profile(
 
     return result, summary
 
+
+def page_k_wheat_pionier(
+    temperature_c,
+    relative_humidity_pct,
+    air_velocity_m_s: float,
+):
+    """
+    Generalized Page k parameter for wheat cv. 'Pionier'
+    according to Ramaj et al. (2021):
+
+        k = 2.8e-3 * exp(0.059*T) * RH^(-0.139) * v^(0.025)
+
+    T  : °C
+    RH : %
+    v  : m/s
+
+    The source reports k in min^-1 and n = 0.784.
+    Valid experimental domain:
+        T = 10...50 °C
+        RH = 20...60 %
+        v = 0.15...1.00 m/s
+    """
+    import numpy as np
+
+    t = pd.Series(temperature_c, dtype="float64")
+    rh = pd.Series(relative_humidity_pct, dtype="float64")
+
+    if not (0.15 <= air_velocity_m_s <= 1.00):
+        raise ValueError(
+            "Швидкість сушильного агента для узагальненої "
+            "моделі Page має бути в межах 0,15–1,00 м/с."
+        )
+
+    valid = (
+        t.between(10.0, 50.0, inclusive="both")
+        & rh.between(20.0, 60.0, inclusive="both")
+    )
+
+    k = pd.Series(
+        np.nan,
+        index=t.index,
+        dtype="float64",
+    )
+
+    k.loc[valid] = (
+        2.8e-3
+        * np.exp(0.059 * t.loc[valid])
+        * rh.loc[valid] ** (-0.139)
+        * float(air_velocity_m_s) ** 0.025
+    )
+
+    return pd.DataFrame(
+        {
+            "page_k_min_inv": k,
+            "page_n": 0.784,
+            "page_validity_ok": valid,
+        },
+        index=t.index,
+    )
+
+
+def prepare_heat_mass_transfer_inputs(
+    equilibrium_profile: pd.DataFrame,
+    air_velocity_m_s: float,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """
+    Stage 14: prepares the time-dependent quantities that are already
+    known for the coupled heat-and-mass-transfer system.
+
+    No outlet-air state, air mass flow, convective coefficient,
+    porosity or product heat capacity are assumed here.
+    """
+    required = {
+        "operating_mode",
+        "drying_air_temperature_c",
+        "drying_air_inlet_rh_pct",
+        "equilibrium_moisture_db_kg_kg",
+        "oswin_validity_ok",
+    }
+
+    missing = required - set(equilibrium_profile.columns)
+    if missing:
+        raise ValueError(
+            "Для етапу 14 відсутні результати попередніх етапів: "
+            + ", ".join(sorted(missing))
+        )
+
+    result = equilibrium_profile.copy()
+
+    page = page_k_wheat_pionier(
+        temperature_c=result["drying_air_temperature_c"],
+        relative_humidity_pct=result["drying_air_inlet_rh_pct"],
+        air_velocity_m_s=air_velocity_m_s,
+    )
+
+    result["air_velocity_m_s"] = float(air_velocity_m_s)
+    result["page_k_min_inv"] = page["page_k_min_inv"]
+    result["page_n"] = page["page_n"]
+
+    result["page_validity_ok"] = (
+        page["page_validity_ok"]
+        & result["oswin_validity_ok"].fillna(False)
+    )
+
+    day_mask = result["operating_mode"] == "Денний режим"
+    active = result.loc[day_mask]
+
+    valid_active = active.loc[
+        active["page_validity_ok"]
+    ]
+
+    summary = {
+        "air_velocity_m_s": float(air_velocity_m_s),
+        "active_intervals": int(day_mask.sum()),
+        "valid_active_intervals": int(
+            valid_active.shape[0]
+        ),
+        "invalid_active_intervals": int(
+            day_mask.sum() - valid_active.shape[0]
+        ),
+        "mean_k_min_inv": (
+            float(valid_active["page_k_min_inv"].mean())
+            if not valid_active.empty
+            else float("nan")
+        ),
+        "min_k_min_inv": (
+            float(valid_active["page_k_min_inv"].min())
+            if not valid_active.empty
+            else float("nan")
+        ),
+        "max_k_min_inv": (
+            float(valid_active["page_k_min_inv"].max())
+            if not valid_active.empty
+            else float("nan")
+        ),
+    }
+
+    return result, summary
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -1208,8 +1347,10 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–9: продукт, масовий баланс, режим сушіння, "
-    "погодні часові ряди та стан зовнішнього вологого повітря."
+    "Етапи 1–14: вихідні дані, масовий баланс, режими, "
+    "погодні дані, психрометрія, геометрія, кінетика Page, "
+    "рівноважна вологість та формування системи "
+    "тепло- і масообміну сушильної камери."
 )
 
 try:
@@ -1219,7 +1360,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -1229,6 +1370,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "6. Геометрія камери і шару",
         "7. Кінетична модель сушіння",
         "8. Рівноважна вологість",
+        "9. Тепло- і масообмін",
     ]
 )
 
@@ -2420,9 +2562,10 @@ with tab_kinetics:
     )
 
     st.info(
-        "На цьому етапі вибирається математична форма кінетичної "
-        "моделі. Числові значення коефіцієнтів моделі поки не "
-        "задаються, щоб не вводити необґрунтовані припущення."
+        "Для пшениці cv. 'Pionier' використовується узагальнена "
+        "модель Page за Ramaj et al. (2021). Показник n є сталим, "
+        "а коефіцієнт k визначається через температуру, відносну "
+        "вологість і швидкість сушильного агента."
     )
 
     st.markdown("#### Прийнята модель")
@@ -2441,6 +2584,15 @@ with tab_kinetics:
         r"\frac{X-X_{\mathrm{e}}}"
         r"{X_0-X_{\mathrm{e}}}"
     )
+
+    st.latex(
+        r"k=2.8\cdot10^{-3}"
+        r"\exp(0.059T)"
+        r"RH^{-0.139}"
+        r"v^{0.025}"
+    )
+
+    st.latex(r"n=0.784")
 
     st.markdown("де:")
 
@@ -2462,7 +2614,7 @@ with tab_kinetics:
         {
             "Джерело": [
                 (
-                    "Brunner et al., 2021, "
+                    "Ramaj et al., 2021, "
                     "Drying Kinetics of Wheat "
                     "(Triticum aestivum L., cv. 'Pionier')"
                 ),
@@ -2527,12 +2679,12 @@ with tab_kinetics:
                     "як функцію температури та відносної вологості"
                 ),
                 (
-                    "Не задано; має визначатися за експериментальними "
-                    "або валідованими літературними даними"
+                    "Визначається за узагальненою залежністю "
+                    "Ramaj et al.: k=f(T, RH, v)"
                 ),
                 (
-                    "Не задано; має визначатися за експериментальними "
-                    "або валідованими літературними даними"
+                    "Для узагальненої моделі прийнято n=0,784 "
+                    "за Ramaj et al. (2021)"
                 ),
             ],
         }
@@ -2551,11 +2703,16 @@ with tab_kinetics:
         "moisture_ratio_equation": (
             "MR = (X - Xe) / (X0 - Xe)"
         ),
-        "k": None,
-        "n": None,
-        "equilibrium_moisture_Xe": None,
+        "k_equation": (
+            "k = 2.8e-3 * exp(0.059*T) * "
+            "RH**(-0.139) * v**0.025"
+        ),
+        "n": 0.784,
+        "equilibrium_moisture_Xe": (
+            "Modified Oswin, calculated in stage 13"
+        ),
         "parameter_status": (
-            "Model structure selected; coefficients not yet assigned."
+            "Generalized Page model from Ramaj et al. (2021)."
         ),
     }
 
@@ -2574,9 +2731,9 @@ with tab_kinetics:
     )
 
     st.warning(
-        "Не слід використовувати довільні значення k та n лише для "
-        "отримання кривої. Це створило б штучну кінетику, яка не має "
-        "фізичного або експериментального обґрунтування."
+        "Узагальнену залежність k та значення n слід застосовувати "
+        "лише в межах експериментальної області Ramaj et al.: "
+        "T=10–50 °C, RH=20–60 %, v=0,15–1,00 м/с."
     )
 
 # ---------------------------------------------------------------------
@@ -2791,9 +2948,327 @@ with tab_equilibrium:
                 key="download_equilibrium_moisture",
             )
 
-            st.info(
-                "Наступний етап — використати Page разом із Xeq "
-                "та залежністю коефіцієнта k від температури, RH "
-                "і швидкості сушильного агента, після чого сформувати "
-                "динамічне рівняння зміни вологовмісту продукту."
+# ---------------------------------------------------------------------
+# 9. СИСТЕМА РІВНЯНЬ ТЕПЛО- І МАСООБМІНУ
+# ---------------------------------------------------------------------
+with tab_heat_mass:
+    st.subheader(
+        "Етап 14. Система рівнянь тепло- і масообміну "
+        "в сушильній камері"
+    )
+
+    st.info(
+        "На цьому етапі формується математичне ядро сушильної "
+        "камери. Повний числовий розв'язок ще не виконується: "
+        "не задаються довільно стан повітря на виході, витрата "
+        "повітря, коефіцієнт теплообміну або теплофізичні "
+        "властивості продукту. Їх буде визначено або обґрунтовано "
+        "на наступному етапі."
+    )
+
+    st.markdown("#### Система рівнянь")
+
+    st.write(
+        "За основу для подальшої моделі приймається одновимірний "
+        "нестаціонарний опис спільного перенесення теплоти та "
+        "вологи в шарі продукту. Для уникнення плутанини "
+        "вологовміст повітря позначено d, а вологовміст продукту — X."
+    )
+
+    st.markdown("**1. Баланс енергії сушильного агента**")
+
+    st.latex(
+        r"\frac{\partial T_a}{\partial t}"
+        r"=-\frac{v_a}{\varepsilon}"
+        r"\frac{\partial T_a}{\partial x}"
+        r"+"
+        r"\frac{h_{a-p}a_s(T_p-T_a)}"
+        r"{\varepsilon\rho_a(c_{a,d}+c_v d)}"
+    )
+
+    st.markdown("**2. Баланс енергії продукту**")
+
+    st.latex(
+        r"\frac{\partial T_p}{\partial t}"
+        r"=\frac{1}"
+        r"{\rho_{p,d}(c_{p,d}+c_wX)}"
+        r"\left["
+        r"h_{a-p}a_s(T_a-T_p)"
+        r"-\rho_a v_a"
+        r"\frac{\partial d}{\partial x}"
+        r"\left("
+        r"L_v+c_v(T_a-T_p)"
+        r"\right)"
+        r"\right]"
+    )
+
+    st.markdown("**3. Баланс вологи сушильного агента**")
+
+    st.latex(
+        r"\frac{\partial d}{\partial t}"
+        r"=-\frac{v_a}{\varepsilon}"
+        r"\frac{\partial d}{\partial x}"
+        r"-\frac{\rho_{p,d}}"
+        r"{\varepsilon\rho_a}"
+        r"\frac{\partial X}{\partial t}"
+    )
+
+    st.markdown("**4. Зміна вологовмісту продукту за Page**")
+
+    st.latex(
+        r"\frac{\partial X}{\partial t}"
+        r"=-nk\,t_{\mathrm{eff}}^{\,n-1}"
+        r"\left(X-X_{\mathrm{eq}}\right)"
+    )
+
+    st.markdown("де:")
+
+    st.markdown(
+        r"""
+- \(T_a\) — температура сушильного агента, °C;
+- \(T_p\) — температура продукту, °C;
+- \(d\) — вологовміст сушильного агента, кг води/кг сухого повітря;
+- \(X\) — вологовміст продукту на сухій основі, кг води/кг сухої речовини;
+- \(X_{\mathrm{eq}}\) — рівноважний вологовміст продукту;
+- \(v_a\) — швидкість сушильного агента, м/с;
+- \(\varepsilon\) — пористість шару;
+- \(\rho_a\) — густина вологого повітря, кг/м³;
+- \(\rho_{p,d}\) — об'ємна густина сухої речовини продукту, кг сухої речовини/м³ шару;
+- \(h_{a-p}\) — коефіцієнт конвективного теплообміну між повітрям і продуктом, Вт/(м²·К);
+- \(a_s\) — питома поверхня тепло- і масообміну продукту, м²/м³;
+- \(c_{a,d}\) — питома теплоємність сухого повітря, Дж/(кг·К);
+- \(c_v\) — питома теплоємність водяної пари, Дж/(кг·К);
+- \(c_{p,d}\) — питома теплоємність сухої речовини продукту, Дж/(кг·К);
+- \(c_w\) — питома теплоємність води, Дж/(кг·К);
+- \(L_v\) — питома теплота випаровування води, Дж/кг;
+- \(t_{\mathrm{eff}}\) — ефективний час сушіння, хв.
+        """
+    )
+
+    st.markdown("#### Параметри Page для поточних умов")
+
+    st.write(
+        "Для змінних умов коефіцієнт k визначається на кожному "
+        "часовому інтервалі за Ramaj et al. (2021):"
+    )
+
+    st.latex(
+        r"k=2.8\cdot10^{-3}"
+        r"\exp(0.059T_a)"
+        r"RH^{-0.139}"
+        r"v_a^{0.025},"
+        r"\qquad n=0.784"
+    )
+
+    # Try to use a recommended velocity from Google Sheets only as a
+    # starting value for the UI. If absent, use the same neutral
+    # literature-domain example value used in the methodology example.
+    default_velocity = 0.50
+
+    try:
+        if (
+            "recommended_air_velocity_m_s" in product.index
+            and pd.notna(product["recommended_air_velocity_m_s"])
+        ):
+            candidate_velocity = float(
+                product["recommended_air_velocity_m_s"]
             )
+            if 0.15 <= candidate_velocity <= 1.00:
+                default_velocity = candidate_velocity
+    except (TypeError, ValueError):
+        pass
+
+    air_velocity_stage14 = st.number_input(
+        "Розрахункова швидкість сушильного агента vₐ, м/с",
+        min_value=0.15,
+        max_value=1.00,
+        value=float(default_velocity),
+        step=0.05,
+        format="%.2f",
+        key="stage14_air_velocity_m_s",
+    )
+
+    st.caption(
+        "Це керований робочий параметр, а не підібраний коефіцієнт "
+        "моделі. На наступному етапі швидкість буде пов'язана з "
+        "витратою сушильного агента та геометрією камери."
+    )
+
+    if "equilibrium_moisture_profile" not in st.session_state:
+        st.warning(
+            "Спочатку сформуйте результати етапу 13 у вкладці "
+            "«Рівноважна вологість»."
+        )
+    else:
+        eq_stage14 = st.session_state[
+            "equilibrium_moisture_profile"
+        ]
+
+        try:
+            coupling_profile, coupling_summary = (
+                prepare_heat_mass_transfer_inputs(
+                    equilibrium_profile=eq_stage14,
+                    air_velocity_m_s=float(air_velocity_stage14),
+                )
+            )
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.session_state[
+                "heat_mass_transfer_input_profile"
+            ] = coupling_profile
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            c1.metric(
+                "Швидкість повітря",
+                f"{coupling_summary['air_velocity_m_s']:.2f} м/с",
+            )
+
+            c2.metric(
+                "Середнє k у валідних інтервалах",
+                (
+                    f"{coupling_summary['mean_k_min_inv']:.5f} хв⁻¹"
+                    if pd.notna(
+                        coupling_summary["mean_k_min_inv"]
+                    )
+                    else "—"
+                ),
+            )
+
+            c3.metric(
+                "Валідні денні інтервали",
+                (
+                    f"{coupling_summary['valid_active_intervals']}"
+                    f"/{coupling_summary['active_intervals']}"
+                ),
+            )
+
+            c4.metric(
+                "n Page",
+                "0.784",
+            )
+
+            if coupling_summary[
+                "invalid_active_intervals"
+            ] > 0:
+                st.warning(
+                    "Частина денних інтервалів лежить поза "
+                    "експериментальною областю узагальненої Page "
+                    "(T=10–50 °C, RH=20–60 %, v=0,15–1,00 м/с). "
+                    "Для них k не обчислюється. Це навмисно: "
+                    "екстраполяція без обґрунтування не виконується."
+                )
+            else:
+                st.success(
+                    "Усі активні денні інтервали лежать у межах "
+                    "експериментальної області узагальненої Page."
+                )
+
+            stage14_columns = [
+                "operating_mode",
+                "drying_air_temperature_c",
+                "drying_air_inlet_rh_pct",
+                "air_velocity_m_s",
+                "equilibrium_moisture_db_kg_kg",
+                "page_k_min_inv",
+                "page_n",
+                "page_validity_ok",
+            ]
+
+            existing_stage14_columns = [
+                col
+                for col in stage14_columns
+                if col in coupling_profile.columns
+            ]
+
+            st.markdown(
+                "#### Часовий ряд уже визначених параметрів системи"
+            )
+
+            st.dataframe(
+                coupling_profile[
+                    existing_stage14_columns
+                ],
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Зміна коефіцієнта k в активному режимі"
+            )
+
+            st.line_chart(
+                coupling_profile[
+                    ["page_k_min_inv"]
+                ],
+                use_container_width=True,
+            )
+
+            st.download_button(
+                "Завантажити вхідні параметри тепло- і масообміну",
+                data=dataframe_to_csv_bytes(
+                    coupling_profile
+                ),
+                file_name=(
+                    "heat_mass_transfer_input_profile.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_heat_mass_inputs",
+            )
+
+    st.markdown("#### Що ще потрібно для числового розв'язку")
+
+    missing_parameters = pd.DataFrame(
+        {
+            "Параметр": [
+                "ε",
+                "ρp,d",
+                "ha-p",
+                "as",
+                "cp,d",
+                "Tp,0",
+                "Витрата сушильного агента",
+                "Стан повітря на виході",
+            ],
+            "Призначення": [
+                "Пористість шару продукту",
+                "Об'ємна густина сухої речовини в шарі",
+                "Конвективний теплообмін повітря-продукт",
+                "Питома поверхня зерна в шарі",
+                "Теплоємність сухої речовини продукту",
+                "Початкова температура продукту",
+                "Зв'язок швидкості потоку з масовою витратою",
+                "Результат спільного балансу повітря і продукту",
+            ],
+            "Статус": [
+                "ще не задано",
+                "ще не визначено",
+                "ще не визначено",
+                "ще не визначено",
+                "ще не задано",
+                "ще не задано",
+                "визначатиметься на етапі 15",
+                "визначатиметься на етапі 15",
+            ],
+        }
+    )
+
+    st.dataframe(
+        missing_parameters,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.warning(
+        "Тому на етапі 14 ми лише формуємо систему та обчислюємо "
+        "ті її коефіцієнти, які вже мають обґрунтовані вхідні дані. "
+        "Повний розрахунок X(t), Tₚ(t), витрати повітря і стану "
+        "повітря на виході переноситься на етап 15."
+    )
+
+    st.info(
+        "Наступний етап — пункт 15: сумісне визначення фактичної "
+        "швидкості сушіння, витрати сушильного агента та стану "
+        "повітря на виході із сушильної камери."
+    )
