@@ -1505,53 +1505,269 @@ def temperature_from_enthalpy_and_humidity_ratio(
     return (h - 2501.0 * w) / (1.006 + 1.86 * w)
 
 
-def simulate_coupled_drying_stage15(
+def saturation_humidity_ratio_kg_kg(
+    temperature_c: float,
+    pressure_kpa: float,
+) -> float:
+    """
+    Saturation humidity ratio, kg water / kg dry air.
+    """
+    p_ws = float(
+        saturation_vapor_pressure_kpa(
+            pd.Series([temperature_c], dtype="float64")
+        ).iloc[0]
+    )
+
+    if p_ws >= pressure_kpa:
+        return float("nan")
+
+    return 0.621945 * p_ws / (pressure_kpa - p_ws)
+
+
+def moist_air_enthalpy_scalar_kj_kg_da(
+    temperature_c: float,
+    humidity_ratio_kg_kg: float,
+) -> float:
+    return (
+        1.006 * temperature_c
+        + humidity_ratio_kg_kg
+        * (2501.0 + 1.86 * temperature_c)
+    )
+
+
+def temperature_from_h_w_scalar(
+    enthalpy_kj_kg_da: float,
+    humidity_ratio_kg_kg: float,
+) -> float:
+    return (
+        enthalpy_kj_kg_da
+        - 2501.0 * humidity_ratio_kg_kg
+    ) / (
+        1.006
+        + 1.86 * humidity_ratio_kg_kg
+    )
+
+
+def relative_humidity_scalar_pct(
+    temperature_c: float,
+    humidity_ratio_kg_kg: float,
+    pressure_kpa: float,
+) -> float:
+    p_v = (
+        humidity_ratio_kg_kg
+        * pressure_kpa
+        / (0.621945 + humidity_ratio_kg_kg)
+    )
+
+    p_ws = float(
+        saturation_vapor_pressure_kpa(
+            pd.Series([temperature_c], dtype="float64")
+        ).iloc[0]
+    )
+
+    if p_ws <= 0:
+        return float("nan")
+
+    return 100.0 * p_v / p_ws
+
+
+def equilibrium_moisture_oswin_scalar(
+    temperature_c: float,
+    relative_humidity_pct: float,
+) -> tuple[float, bool]:
+    """
+    Modified Oswin from Ramaj et al. (2021).
+
+    Returns:
+        Xeq, validity
+    """
+    if not (
+        10.0 <= temperature_c <= 50.0
+        and 5.7 <= relative_humidity_pct <= 86.8
+    ):
+        return float("nan"), False
+
+    aw = relative_humidity_pct / 100.0
+
+    if not (0.0 < aw < 1.0):
+        return float("nan"), False
+
+    c1 = 0.129
+    c2 = -6.460e-4
+    c3 = 2.944
+
+    xeq = (
+        (c1 + c2 * temperature_c)
+        * (aw / (1.0 - aw)) ** (1.0 / c3)
+    )
+
+    return float(xeq), True
+
+
+def page_k_scalar_wheat_pionier(
+    temperature_c: float,
+    relative_humidity_pct: float,
+    air_velocity_m_s: float,
+) -> tuple[float, str]:
+    """
+    Generalized Page correlation from Ramaj et al. (2021).
+
+    Experimental Page conditions:
+        T = 10...50 °C
+        RH = 20...60 %
+        v = 0.15...1.00 m/s
+
+    RH outside 20...60 % is explicitly treated as extrapolation.
+    T or v outside their experimental range => no calculation.
+    """
+    import math
+
+    if not (
+        10.0 <= temperature_c <= 50.0
+        and 0.15 <= air_velocity_m_s <= 1.00
+        and 0.0 < relative_humidity_pct < 100.0
+    ):
+        return float("nan"), "outside_page_domain"
+
+    k = (
+        2.8e-3
+        * math.exp(0.059 * temperature_c)
+        * relative_humidity_pct ** (-0.139)
+        * air_velocity_m_s ** 0.025
+    )
+
+    if 20.0 <= relative_humidity_pct <= 60.0:
+        status = "validated"
+    else:
+        status = "rh_extrapolation"
+
+    return float(k), status
+
+
+def adiabatic_saturation_state(
+    inlet_enthalpy_kj_kg_da: float,
+    pressure_kpa: float,
+    upper_temperature_c: float,
+) -> tuple[float, float]:
+    """
+    Finds the saturated state on the same moist-air enthalpy line.
+
+    It is used only as a physical upper bound on how much additional
+    water can remain in the vapour phase during the present simplified
+    stage-15 calculation.
+
+    Returns:
+        T_sat_ad, w_sat_ad
+    """
+    import math
+
+    upper = min(float(upper_temperature_c), 60.0)
+    lower = -30.0
+
+    def residual(temp_c):
+        w_sat = saturation_humidity_ratio_kg_kg(
+            temp_c,
+            pressure_kpa,
+        )
+
+        if not math.isfinite(w_sat):
+            return float("nan")
+
+        return (
+            moist_air_enthalpy_scalar_kj_kg_da(
+                temp_c,
+                w_sat,
+            )
+            - inlet_enthalpy_kj_kg_da
+        )
+
+    f_low = residual(lower)
+    f_high = residual(upper)
+
+    if not (
+        math.isfinite(f_low)
+        and math.isfinite(f_high)
+    ):
+        return float("nan"), float("nan")
+
+    # For normal unsaturated inlet air, the constant-enthalpy
+    # saturation state should lie between lower and inlet T.
+    if f_low > 0 or f_high < 0:
+        return float("nan"), float("nan")
+
+    for _ in range(70):
+        mid = 0.5 * (lower + upper)
+        f_mid = residual(mid)
+
+        if not math.isfinite(f_mid):
+            return float("nan"), float("nan")
+
+        if f_mid > 0:
+            upper = mid
+        else:
+            lower = mid
+
+    t_sat = 0.5 * (lower + upper)
+    w_sat = saturation_humidity_ratio_kg_kg(
+        t_sat,
+        pressure_kpa,
+    )
+
+    return float(t_sat), float(w_sat)
+
+
+def simulate_zonal_coupled_drying_stage15(
     input_profile: pd.DataFrame,
     dry_matter_kg: float,
     initial_x_db: float,
     target_x_db: float,
     step_minutes: int,
     effective_flow_area_m2: float,
-) -> tuple[pd.DataFrame, dict[str, float]]:
+    zone_count: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
     """
-    Етап 15.
+    Improved stage 15.
 
-    1. Фактичний X(t) розраховується за узагальненою Page.
-    2. Для змінних умов Page інтегрується покроково:
-       X_(i+1) = Xeq_i + (X_i - Xeq_i) *
-                 exp[-k_i * ((tau+dt)^n - tau^n)]
+    Key changes compared with the previous lumped calculation:
 
-       Це числова адаптація Page до змінних умов. Вона точно
-       відтворює класичну Page за сталих k та Xeq, але сама
-       адаптація до змінних умов не була окремо валідована
-       Ramaj et al. (2021).
+    1. The product is divided into sequential computational zones
+       along the airflow path.
 
-    3. Об'ємна витрата повітря визначається:
-       Vdot = v * A_eff
+    2. Air passes zone 1 -> zone 2 -> ... -> zone N. Moisture added
+       in an upstream zone therefore increases d and RH and, under
+       the adiabatic diagnostic approximation, reduces T before the
+       air reaches the next zone.
 
-    4. Масова витрата сухого повітря:
-       mdot_da = rho_da * Vdot
+    3. Page is evaluated with the LOCAL inlet T and RH of each zone.
 
-    5. Вологовміст на виході з балансу води:
-       d_out = d_in + mdot_evap / mdot_da
+    4. Ramaj et al. used wheat with X0 = 0.159 ± 0.001 kg/kg d.b.
+       If the current zone moisture is above 0.160 kg/kg d.b.,
+       the use of Page is explicitly flagged as extrapolation with
+       respect to the source experiment's initial moisture level.
+       No invented correction factor is applied.
 
-    6. Для діагностичної оцінки T_out та RH_out використовується
-       адіабатичне наближення h_out = h_in. Це ще не остаточний
-       тепловий баланс сушильної камери.
+    5. Page-predicted water removal is limited by the maximum amount
+       of water that the airflow can carry to the adiabatic saturation
+       state over the time step. This prevents RH > 100 % by
+       construction and couples drying rate to airflow capacity.
+
+    6. Active airflow stops automatically after ALL zones reach the
+       specified final moisture target.
+
+    Important:
+    The serial-zone/variable-condition adaptation is a numerical
+    extension of the source Page model. It must later be validated
+    against the experiment of the dissertation.
     """
+    import math
     import numpy as np
 
     required = {
         "operating_mode",
         "drying_air_temperature_c",
-        "drying_air_inlet_rh_pct",
         "humidity_ratio_kg_kg",
         "PS",
         "air_velocity_m_s",
-        "equilibrium_moisture_db_kg_kg",
-        "page_k_min_inv",
-        "page_n",
-        "drying_model_status",
     }
 
     missing = required - set(input_profile.columns)
@@ -1561,345 +1777,683 @@ def simulate_coupled_drying_stage15(
             + ", ".join(sorted(missing))
         )
 
-    if effective_flow_area_m2 <= 0:
-        raise ValueError(
-            "Ефективна площа проходу сушильного агента має бути > 0."
-        )
-
     if dry_matter_kg <= 0:
-        raise ValueError("Маса сухої речовини має бути > 0.")
+        raise ValueError(
+            "Маса сухої речовини має бути більшою за нуль."
+        )
 
     if target_x_db >= initial_x_db:
         raise ValueError(
             "Кінцевий вологовміст має бути меншим за початковий."
         )
 
-    result = input_profile.copy()
+    if effective_flow_area_m2 <= 0:
+        raise ValueError(
+            "Ефективна площа проходу повітря має бути > 0."
+        )
 
-    n_rows = len(result)
-
-    x_start = np.full(n_rows, np.nan, dtype=float)
-    x_end = np.full(n_rows, np.nan, dtype=float)
-    moisture_removed_interval = np.zeros(n_rows, dtype=float)
-    moisture_removal_rate_kg_h = np.zeros(n_rows, dtype=float)
-    active_time_start_min = np.zeros(n_rows, dtype=float)
-    active_time_end_min = np.zeros(n_rows, dtype=float)
-    target_reached = np.zeros(n_rows, dtype=bool)
-
-    current_x = float(initial_x_db)
-    active_time_min = 0.0
+    if zone_count < 2:
+        raise ValueError(
+            "Для зональної моделі потрібно щонайменше 2 зони."
+        )
 
     dt_min = float(step_minutes)
+    dt_s = dt_min * 60.0
     dt_h = dt_min / 60.0
+
+    result = input_profile.copy()
+    n_rows = len(result)
+
+    dry_mass_zone = float(dry_matter_kg) / int(zone_count)
+
+    # State of every product zone.
+    x_zone = np.full(
+        int(zone_count),
+        float(initial_x_db),
+        dtype=float,
+    )
+
+    tau_zone_min = np.zeros(
+        int(zone_count),
+        dtype=float,
+    )
+
+    source_initial_x_db = 0.159
+    source_initial_x_uncertainty = 0.001
+    source_upper_observed_x_db = (
+        source_initial_x_db
+        + source_initial_x_uncertainty
+    )
+
+    # Time-series outputs.
+    avg_x_start = np.full(n_rows, np.nan)
+    avg_x_end = np.full(n_rows, np.nan)
+
+    avg_wb_end = np.full(n_rows, np.nan)
+
+    total_removed_interval = np.zeros(n_rows)
+    removal_rate_kg_h = np.zeros(n_rows)
+
+    air_volume_flow_m3_h = np.zeros(n_rows)
+    dry_air_mass_flow_kg_h = np.zeros(n_rows)
+
+    inlet_w = np.full(n_rows, np.nan)
+    outlet_w = np.full(n_rows, np.nan)
+
+    inlet_t = np.full(n_rows, np.nan)
+    outlet_t = np.full(n_rows, np.nan)
+
+    inlet_rh = np.full(n_rows, np.nan)
+    outlet_rh = np.full(n_rows, np.nan)
+
+    active_drying = np.zeros(n_rows, dtype=bool)
+    all_zones_target = np.zeros(n_rows, dtype=bool)
+
+    capacity_limited_interval = np.zeros(
+        n_rows,
+        dtype=bool,
+    )
+
+    source_moisture_extrapolation_interval = np.zeros(
+        n_rows,
+        dtype=bool,
+    )
+
+    page_rh_extrapolation_interval = np.zeros(
+        n_rows,
+        dtype=bool,
+    )
+
+    unusable_zone_interval = np.zeros(
+        n_rows,
+        dtype=bool,
+    )
+
+    zone_records = []
+
+    source_extrapolated_removed_kg = 0.0
+    total_page_predicted_removed_kg = 0.0
+    total_capacity_limited_kg = 0.0
 
     for pos in range(n_rows):
         row = result.iloc[pos]
 
-        x_start[pos] = current_x
-        active_time_start_min[pos] = active_time_min
+        avg_x_start[pos] = float(x_zone.mean())
 
-        is_day = row["operating_mode"] == "Денний режим"
-        status = row["drying_model_status"]
-
-        can_dry = (
-            is_day
-            and status in ("validated", "page_rh_extrapolation")
-            and pd.notna(row["page_k_min_inv"])
-            and pd.notna(row["page_n"])
-            and pd.notna(row["equilibrium_moisture_db_kg_kg"])
-            and current_x > target_x_db
+        is_day = (
+            row["operating_mode"] == "Денний режим"
         )
 
-        if can_dry:
-            k = float(row["page_k_min_inv"])
-            n = float(row["page_n"])
-            xeq = float(
-                row["equilibrium_moisture_db_kg_kg"]
+        zones_finished_before = bool(
+            np.all(
+                x_zone <= float(target_x_db) + 1e-12
+            )
+        )
+
+        can_run = (
+            is_day
+            and not zones_finished_before
+            and pd.notna(row["drying_air_temperature_c"])
+            and pd.notna(row["humidity_ratio_kg_kg"])
+            and pd.notna(row["PS"])
+            and pd.notna(row["air_velocity_m_s"])
+        )
+
+        if not can_run:
+            avg_x_end[pos] = float(x_zone.mean())
+            avg_wb_end[pos] = (
+                avg_x_end[pos]
+                / (1.0 + avg_x_end[pos])
+                * 100.0
             )
 
-            # Якщо X <= Xeq, рушійної сили сушіння немає.
-            if current_x > xeq:
+            all_zones_target[pos] = bool(
+                np.all(
+                    x_zone
+                    <= float(target_x_db) + 1e-12
+                )
+            )
+            continue
+
+        active_drying[pos] = True
+
+        t_air = float(
+            row["drying_air_temperature_c"]
+        )
+        w_air = float(
+            row["humidity_ratio_kg_kg"]
+        )
+        p_kpa = float(row["PS"])
+        velocity = float(row["air_velocity_m_s"])
+
+        inlet_t[pos] = t_air
+        inlet_w[pos] = w_air
+        inlet_rh[pos] = relative_humidity_scalar_pct(
+            t_air,
+            w_air,
+            p_kpa,
+        )
+
+        volume_flow_m3_s = (
+            velocity
+            * float(effective_flow_area_m2)
+        )
+
+        rho_da_in = float(
+            calculate_dry_air_density_kg_m3(
+                temperature_c=pd.Series([t_air]),
+                humidity_ratio_kg_kg=pd.Series([w_air]),
+                pressure_kpa=pd.Series([p_kpa]),
+            ).iloc[0]
+        )
+
+        mdot_da_kg_s = (
+            rho_da_in
+            * volume_flow_m3_s
+        )
+
+        if (
+            not math.isfinite(mdot_da_kg_s)
+            or mdot_da_kg_s <= 0
+        ):
+            raise ValueError(
+                "Не вдалося визначити додатну масову "
+                "витрату сухого повітря."
+            )
+
+        air_volume_flow_m3_h[pos] = (
+            volume_flow_m3_s * 3600.0
+        )
+        dry_air_mass_flow_kg_h[pos] = (
+            mdot_da_kg_s * 3600.0
+        )
+
+        removed_this_step = 0.0
+
+        # Air is propagated serially through the zones.
+        for zone_idx in range(int(zone_count)):
+            x_old = float(x_zone[zone_idx])
+
+            zone_in_t = float(t_air)
+            zone_in_w = float(w_air)
+
+            zone_in_rh = relative_humidity_scalar_pct(
+                zone_in_t,
+                zone_in_w,
+                p_kpa,
+            )
+
+            xeq, oswin_ok = (
+                equilibrium_moisture_oswin_scalar(
+                    zone_in_t,
+                    zone_in_rh,
+                )
+            )
+
+            k, page_status = (
+                page_k_scalar_wheat_pionier(
+                    zone_in_t,
+                    zone_in_rh,
+                    velocity,
+                )
+            )
+
+            source_moisture_extrapolation = (
+                x_old
+                > source_upper_observed_x_db
+                + 1e-12
+            )
+
+            if source_moisture_extrapolation:
+                source_moisture_extrapolation_interval[
+                    pos
+                ] = True
+
+            if page_status == "rh_extrapolation":
+                page_rh_extrapolation_interval[pos] = True
+
+            zone_finished = (
+                x_old
+                <= float(target_x_db) + 1e-12
+            )
+
+            model_usable = (
+                not zone_finished
+                and oswin_ok
+                and math.isfinite(k)
+                and math.isfinite(xeq)
+                and x_old > xeq
+            )
+
+            page_removed_kg = 0.0
+            air_capacity_kg = 0.0
+            actual_removed_kg = 0.0
+            limited_by_air_capacity = False
+
+            if model_usable:
+                n_page = 0.784
+
+                tau_old = float(
+                    tau_zone_min[zone_idx]
+                )
+
                 exponent_increment = (
                     k
                     * (
-                        (active_time_min + dt_min) ** n
-                        - active_time_min ** n
+                        (tau_old + dt_min) ** n_page
+                        - tau_old ** n_page
                     )
                 )
 
-                predicted_x = (
+                x_page = (
                     xeq
-                    + (current_x - xeq)
-                    * np.exp(-exponent_increment)
+                    + (x_old - xeq)
+                    * math.exp(-exponent_increment)
                 )
 
-                # Не дозволяємо моделі перейти нижче заданої
-                # кінцевої вологості користувача.
-                next_x = max(
+                # The target moisture is a process constraint.
+                x_page = max(
                     float(target_x_db),
-                    float(predicted_x),
+                    float(x_page),
                 )
+
+                page_removed_kg = max(
+                    0.0,
+                    dry_mass_zone
+                    * (x_old - x_page),
+                )
+
+                total_page_predicted_removed_kg += (
+                    page_removed_kg
+                )
+
+                h_zone_in = (
+                    moist_air_enthalpy_scalar_kj_kg_da(
+                        zone_in_t,
+                        zone_in_w,
+                    )
+                )
+
+                _, w_sat_ad = adiabatic_saturation_state(
+                    inlet_enthalpy_kj_kg_da=h_zone_in,
+                    pressure_kpa=p_kpa,
+                    upper_temperature_c=zone_in_t,
+                )
+
+                if math.isfinite(w_sat_ad):
+                    air_capacity_kg = max(
+                        0.0,
+                        mdot_da_kg_s
+                        * dt_s
+                        * (w_sat_ad - zone_in_w),
+                    )
+                else:
+                    air_capacity_kg = float("inf")
+
+                actual_removed_kg = min(
+                    page_removed_kg,
+                    air_capacity_kg,
+                )
+
+                limited_by_air_capacity = (
+                    actual_removed_kg
+                    < page_removed_kg - 1e-12
+                )
+
+                if limited_by_air_capacity:
+                    capacity_limited_interval[
+                        pos
+                    ] = True
+
+                    total_capacity_limited_kg += (
+                        page_removed_kg
+                        - actual_removed_kg
+                    )
+
+                x_new = (
+                    x_old
+                    - actual_removed_kg
+                    / dry_mass_zone
+                )
+
+                x_new = max(
+                    float(target_x_db),
+                    float(x_new),
+                )
+
+                tau_zone_min[zone_idx] += dt_min
             else:
-                next_x = current_x
+                x_new = x_old
 
-            active_time_min += dt_min
-        else:
-            next_x = current_x
+                if (
+                    not zone_finished
+                    and not model_usable
+                ):
+                    unusable_zone_interval[pos] = True
 
-        x_end[pos] = next_x
-        active_time_end_min[pos] = active_time_min
+            x_zone[zone_idx] = x_new
 
-        removed_kg = max(
-            0.0,
-            dry_matter_kg * (current_x - next_x),
-        )
+            if (
+                source_moisture_extrapolation
+                and actual_removed_kg > 0
+            ):
+                source_extrapolated_removed_kg += (
+                    actual_removed_kg
+                )
 
-        moisture_removed_interval[pos] = removed_kg
+            removed_this_step += actual_removed_kg
 
-        if dt_h > 0:
-            moisture_removal_rate_kg_h[pos] = (
-                removed_kg / dt_h
+            # Moisture balance across current zone.
+            zone_out_w = (
+                zone_in_w
+                + actual_removed_kg
+                / (
+                    mdot_da_kg_s
+                    * dt_s
+                )
             )
 
-        if next_x <= target_x_db + 1e-12:
-            target_reached[pos] = True
+            # Adiabatic diagnostic propagation through the zone.
+            h_zone_in = (
+                moist_air_enthalpy_scalar_kj_kg_da(
+                    zone_in_t,
+                    zone_in_w,
+                )
+            )
 
-        current_x = next_x
+            zone_out_t = (
+                temperature_from_h_w_scalar(
+                    h_zone_in,
+                    zone_out_w,
+                )
+            )
 
-    result["actual_x_start_db_kg_kg"] = x_start
-    result["actual_x_end_db_kg_kg"] = x_end
+            zone_out_rh = (
+                relative_humidity_scalar_pct(
+                    zone_out_t,
+                    zone_out_w,
+                    p_kpa,
+                )
+            )
 
-    result["actual_moisture_start_wb_pct"] = (
-        result["actual_x_start_db_kg_kg"]
-        / (1.0 + result["actual_x_start_db_kg_kg"])
-        * 100.0
-    )
+            zone_records.append(
+                {
+                    "time_local": (
+                        result.index[pos]
+                        if result.index.name is not None
+                        else pos
+                    ),
+                    "time_position": pos,
+                    "zone": zone_idx + 1,
+                    "zone_count": int(zone_count),
+                    "x_start_db_kg_kg": x_old,
+                    "x_end_db_kg_kg": x_new,
+                    "moisture_end_wb_pct": (
+                        x_new / (1.0 + x_new) * 100.0
+                    ),
+                    "air_inlet_temp_c": zone_in_t,
+                    "air_inlet_rh_pct": zone_in_rh,
+                    "air_inlet_humidity_ratio_g_kg": (
+                        zone_in_w * 1000.0
+                    ),
+                    "xeq_db_kg_kg": xeq,
+                    "page_k_min_inv": k,
+                    "page_status": page_status,
+                    "oswin_validity_ok": oswin_ok,
+                    "source_initial_moisture_extrapolation": (
+                        source_moisture_extrapolation
+                    ),
+                    "page_predicted_water_removed_kg": (
+                        page_removed_kg
+                    ),
+                    "air_vapour_capacity_kg": (
+                        air_capacity_kg
+                        if math.isfinite(air_capacity_kg)
+                        else float("nan")
+                    ),
+                    "actual_water_removed_kg": (
+                        actual_removed_kg
+                    ),
+                    "air_capacity_limited": (
+                        limited_by_air_capacity
+                    ),
+                    "air_outlet_temp_c": zone_out_t,
+                    "air_outlet_rh_pct": zone_out_rh,
+                    "air_outlet_humidity_ratio_g_kg": (
+                        zone_out_w * 1000.0
+                    ),
+                }
+            )
 
-    result["actual_moisture_end_wb_pct"] = (
-        result["actual_x_end_db_kg_kg"]
-        / (1.0 + result["actual_x_end_db_kg_kg"])
-        * 100.0
-    )
+            # The outlet of this zone is the inlet of the next zone.
+            t_air = zone_out_t
+            w_air = zone_out_w
 
-    result["active_drying_time_start_min"] = (
-        active_time_start_min
-    )
-    result["active_drying_time_end_min"] = (
-        active_time_end_min
+        total_removed_interval[pos] = (
+            removed_this_step
+        )
+
+        removal_rate_kg_h[pos] = (
+            removed_this_step / dt_h
+        )
+
+        outlet_t[pos] = t_air
+        outlet_w[pos] = w_air
+        outlet_rh[pos] = (
+            relative_humidity_scalar_pct(
+                t_air,
+                w_air,
+                p_kpa,
+            )
+        )
+
+        avg_x_end[pos] = float(x_zone.mean())
+        avg_wb_end[pos] = (
+            avg_x_end[pos]
+            / (1.0 + avg_x_end[pos])
+            * 100.0
+        )
+
+        all_zones_target[pos] = bool(
+            np.all(
+                x_zone
+                <= float(target_x_db) + 1e-12
+            )
+        )
+
+    # -------------------------------------------------------------
+    # Main time-series result
+    # -------------------------------------------------------------
+    result["zonal_average_x_start_db_kg_kg"] = avg_x_start
+    result["zonal_average_x_end_db_kg_kg"] = avg_x_end
+
+    result["zonal_average_moisture_end_wb_pct"] = (
+        avg_wb_end
     )
 
     result["actual_water_removed_interval_kg"] = (
-        moisture_removed_interval
+        total_removed_interval
     )
 
     result["actual_water_removal_rate_kg_h"] = (
-        moisture_removal_rate_kg_h
+        removal_rate_kg_h
     )
 
-    result["target_final_moisture_reached"] = (
-        target_reached
+    result["active_drying_command"] = active_drying
+    result["all_zones_target_reached"] = (
+        all_zones_target
     )
 
-    # -------------------------------------------------------------
-    # Air flow from geometry and velocity
-    # -------------------------------------------------------------
     result["effective_flow_area_m2"] = float(
         effective_flow_area_m2
     )
 
-    result["drying_air_volume_flow_m3_s"] = (
-        pd.to_numeric(
-            result["air_velocity_m_s"],
-            errors="coerce",
-        )
-        * float(effective_flow_area_m2)
-    )
+    result["zone_count"] = int(zone_count)
 
     result["drying_air_volume_flow_m3_h"] = (
-        result["drying_air_volume_flow_m3_s"] * 3600.0
-    )
-
-    dry_air_density = calculate_dry_air_density_kg_m3(
-        temperature_c=result["drying_air_temperature_c"],
-        humidity_ratio_kg_kg=result["humidity_ratio_kg_kg"],
-        pressure_kpa=result["PS"],
-    )
-    dry_air_density.index = result.index
-
-    result["dry_air_density_kg_m3"] = dry_air_density
-
-    result["dry_air_mass_flow_kg_s"] = (
-        result["drying_air_volume_flow_m3_s"]
-        * result["dry_air_density_kg_m3"]
+        air_volume_flow_m3_h
     )
 
     result["dry_air_mass_flow_kg_h"] = (
-        result["dry_air_mass_flow_kg_s"] * 3600.0
+        dry_air_mass_flow_kg_h
     )
 
-    # Night mode is not treated as active drying in the present model.
-    day_mask = result["operating_mode"] == "Денний режим"
+    result["zonal_air_inlet_temp_c"] = inlet_t
+    result["zonal_air_outlet_temp_c"] = outlet_t
 
-    result.loc[
-        ~day_mask,
-        [
-            "drying_air_volume_flow_m3_s",
-            "drying_air_volume_flow_m3_h",
-            "dry_air_mass_flow_kg_s",
-            "dry_air_mass_flow_kg_h",
-        ],
-    ] = 0.0
+    result["zonal_air_inlet_rh_pct"] = inlet_rh
+    result["zonal_air_outlet_rh_pct"] = outlet_rh
 
-    # -------------------------------------------------------------
-    # Moisture balance of drying air
-    # -------------------------------------------------------------
-    result["actual_water_removal_rate_kg_s"] = (
-        result["actual_water_removal_rate_kg_h"] / 3600.0
+    result["zonal_air_inlet_humidity_ratio_kg_kg"] = (
+        inlet_w
     )
 
-    result["drying_air_outlet_humidity_ratio_kg_kg"] = (
-        result["humidity_ratio_kg_kg"]
+    result["zonal_air_outlet_humidity_ratio_kg_kg"] = (
+        outlet_w
     )
 
-    positive_air_flow = (
-        result["dry_air_mass_flow_kg_s"] > 0
+    result["zonal_air_outlet_humidity_ratio_g_kg"] = (
+        outlet_w * 1000.0
     )
 
-    result.loc[
-        positive_air_flow,
-        "drying_air_outlet_humidity_ratio_kg_kg",
-    ] = (
-        result.loc[
-            positive_air_flow,
-            "humidity_ratio_kg_kg",
-        ]
-        + result.loc[
-            positive_air_flow,
-            "actual_water_removal_rate_kg_s",
-        ]
-        / result.loc[
-            positive_air_flow,
-            "dry_air_mass_flow_kg_s",
-        ]
+    result["air_capacity_limited_interval"] = (
+        capacity_limited_interval
     )
 
-    result["drying_air_outlet_humidity_ratio_g_kg"] = (
-        result["drying_air_outlet_humidity_ratio_kg_kg"]
-        * 1000.0
+    result[
+        "source_initial_moisture_extrapolation_interval"
+    ] = source_moisture_extrapolation_interval
+
+    result[
+        "page_rh_extrapolation_interval"
+    ] = page_rh_extrapolation_interval
+
+    result["unusable_zone_interval"] = (
+        unusable_zone_interval
     )
 
-    # -------------------------------------------------------------
-    # Diagnostic adiabatic outlet state
-    # -------------------------------------------------------------
-    h_in = moist_air_enthalpy_kj_kg_da(
-        temperature_c=result["drying_air_temperature_c"],
-        humidity_ratio_kg_kg=result["humidity_ratio_kg_kg"],
-    )
-    h_in.index = result.index
+    zone_df = pd.DataFrame(zone_records)
 
-    result["drying_air_inlet_enthalpy_kj_kg_da"] = h_in
-
-    outlet_t = temperature_from_enthalpy_and_humidity_ratio(
-        enthalpy_kj_kg_da=h_in,
-        humidity_ratio_kg_kg=(
-            result[
-                "drying_air_outlet_humidity_ratio_kg_kg"
-            ]
-        ),
-    )
-    outlet_t.index = result.index
-
-    result["diagnostic_adiabatic_outlet_temp_c"] = (
-        outlet_t
+    final_avg_x = float(x_zone.mean())
+    final_avg_wb = (
+        final_avg_x
+        / (1.0 + final_avg_x)
+        * 100.0
     )
 
-    outlet_rh = relative_humidity_from_humidity_ratio(
-        temperature_c=outlet_t,
-        humidity_ratio_kg_kg=(
-            result[
-                "drying_air_outlet_humidity_ratio_kg_kg"
-            ]
-        ),
-        pressure_kpa=result["PS"],
-    )
-    outlet_rh.index = result.index
-
-    result["diagnostic_adiabatic_outlet_rh_pct"] = (
-        outlet_rh
+    total_removed = float(
+        total_removed_interval.sum()
     )
 
-    result["diagnostic_outlet_supersaturation"] = (
-        result["diagnostic_adiabatic_outlet_rh_pct"] > 100.0
-    )
-
-    # Night mode: outlet state not defined in this active-drying step.
-    result.loc[
-        ~day_mask,
-        [
-            "drying_air_outlet_humidity_ratio_kg_kg",
-            "drying_air_outlet_humidity_ratio_g_kg",
-            "drying_air_inlet_enthalpy_kj_kg_da",
-            "diagnostic_adiabatic_outlet_temp_c",
-            "diagnostic_adiabatic_outlet_rh_pct",
-        ],
-    ] = pd.NA
-
-    final_x = float(result["actual_x_end_db_kg_kg"].iloc[-1])
-
-    total_removed_kg = float(
-        result["actual_water_removed_interval_kg"].sum()
-    )
-
-    active_rates = result.loc[
+    positive_rates = result.loc[
         result["actual_water_removal_rate_kg_h"] > 0,
         "actual_water_removal_rate_kg_h",
     ]
 
-    day_air = result.loc[
-        day_mask & (result["dry_air_mass_flow_kg_h"] > 0)
+    positive_air = result.loc[
+        result["drying_air_volume_flow_m3_h"] > 0,
+        "drying_air_volume_flow_m3_h",
     ]
 
+    target_reached = bool(
+        np.all(
+            x_zone <= float(target_x_db) + 1e-12
+        )
+    )
+
+    target_time = None
+
+    if result["all_zones_target_reached"].any():
+        first_target_pos = int(
+            np.flatnonzero(
+                result[
+                    "all_zones_target_reached"
+                ].to_numpy()
+            )[0]
+        )
+
+        if "time_local" in result.columns:
+            target_time = str(
+                result.iloc[first_target_pos][
+                    "time_local"
+                ]
+            )
+        else:
+            target_time = str(
+                result.index[first_target_pos]
+            )
+
     summary = {
-        "initial_x_db": float(initial_x_db),
-        "target_x_db": float(target_x_db),
-        "final_x_db": final_x,
-        "final_wb_pct": (
-            final_x / (1.0 + final_x) * 100.0
+        "source_initial_x_db": (
+            source_initial_x_db
         ),
-        "total_water_removed_kg": total_removed_kg,
+        "source_initial_x_uncertainty": (
+            source_initial_x_uncertainty
+        ),
+        "source_upper_observed_x_db": (
+            source_upper_observed_x_db
+        ),
+        "source_initial_wb_pct": (
+            source_initial_x_db
+            / (1.0 + source_initial_x_db)
+            * 100.0
+        ),
+        "model_initial_x_db": float(initial_x_db),
+        "model_initial_wb_pct": (
+            float(initial_x_db)
+            / (1.0 + float(initial_x_db))
+            * 100.0
+        ),
+        "initial_moisture_extrapolation": bool(
+            initial_x_db
+            > source_upper_observed_x_db
+        ),
+        "zone_count": int(zone_count),
+        "final_average_x_db": final_avg_x,
+        "final_average_wb_pct": final_avg_wb,
+        "total_water_removed_kg": total_removed,
         "mean_actual_removal_rate_kg_h": (
-            float(active_rates.mean())
-            if not active_rates.empty
+            float(positive_rates.mean())
+            if not positive_rates.empty
             else 0.0
         ),
         "max_actual_removal_rate_kg_h": (
-            float(active_rates.max())
-            if not active_rates.empty
+            float(positive_rates.max())
+            if not positive_rates.empty
             else 0.0
         ),
-        "mean_dry_air_mass_flow_kg_h": (
-            float(day_air["dry_air_mass_flow_kg_h"].mean())
-            if not day_air.empty
+        "mean_active_air_volume_flow_m3_h": (
+            float(positive_air.mean())
+            if not positive_air.empty
             else 0.0
         ),
-        "mean_air_volume_flow_m3_h": (
-            float(
-                day_air["drying_air_volume_flow_m3_h"].mean()
-            )
-            if not day_air.empty
+        "target_reached": target_reached,
+        "target_time": target_time,
+        "source_extrapolated_removed_kg": (
+            float(source_extrapolated_removed_kg)
+        ),
+        "source_extrapolated_removed_fraction_pct": (
+            100.0
+            * source_extrapolated_removed_kg
+            / total_removed
+            if total_removed > 0
             else 0.0
         ),
-        "target_reached": bool(
-            (result["actual_x_end_db_kg_kg"] <= target_x_db + 1e-12).any()
+        "air_capacity_limited_intervals": int(
+            capacity_limited_interval.sum()
         ),
-        "supersaturated_intervals": int(
-            result[
-                "diagnostic_outlet_supersaturation"
-            ].fillna(False).sum()
+        "air_capacity_limited_water_difference_kg": (
+            float(total_capacity_limited_kg)
+        ),
+        "page_rh_extrapolated_intervals": int(
+            page_rh_extrapolation_interval.sum()
+        ),
+        "unusable_intervals": int(
+            unusable_zone_interval.sum()
         ),
     }
 
-    return result, summary
+    return result, zone_df, summary
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
@@ -1916,7 +2470,7 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–14: вихідні дані, масовий баланс, режими, "
+    "Етапи 1–15: вихідні дані, масовий баланс, режими, "
     "погодні дані, психрометрія, геометрія, кінетика Page, "
     "рівноважна вологість та формування системи "
     "тепло- і масообміну сушильної камери."
@@ -3895,39 +4449,64 @@ with tab_heat_mass:
 # ---------------------------------------------------------------------
 with tab_coupled:
     st.subheader(
-        "Етап 15. Фактична швидкість сушіння, витрата "
-        "сушильного агента та стан повітря на виході"
+        "Етап 15. Зональний спільний розрахунок сушіння"
     )
 
     st.info(
-        "На цьому етапі вперше виконується покроковий числовий "
-        "розрахунок фактичного вологовмісту продукту за Page. "
-        "Одночасно через геометрію камери та швидкість повітря "
-        "визначається витрата сушильного агента, а за балансом "
-        "вологи — його вологовміст на виході."
+        "Попередня однозонна схема замінена на послідовну зональну "
+        "модель. Повітря проходить через розрахункові зони одну за "
+        "одною; після кожної зони його вологовміст збільшується, "
+        "а температура за адіабатичним наближенням зменшується. "
+        "Тому наступна зона вже не отримує ті самі умови, що й перша."
     )
 
-    st.markdown("#### 1. Покрокова Page-модель")
+    st.markdown("#### 1. Обмеження вихідної Page-моделі")
 
-    st.latex(
-        r"X_{i+1}=X_{\mathrm{eq},i}"
-        r"+\left(X_i-X_{\mathrm{eq},i}\right)"
-        r"\exp\left\{-k_i"
-        r"\left[(\tau_i+\Delta t)^n-\tau_i^n\right]\right\}"
+    source_x0 = 0.159
+    source_x0_unc = 0.001
+    source_w0 = source_x0 / (1.0 + source_x0) * 100.0
+
+    model_x0 = (
+        float(product["initial_moisture_pct"]) / 100.0
+    ) / (
+        1.0
+        - float(product["initial_moisture_pct"]) / 100.0
     )
 
     st.write(
-        "Тут τ — накопичений час саме активного денного сушіння. "
-        "У нічному режимі він не збільшується, а X залишається "
-        "незмінним у поточній версії моделі."
+        "Ramaj et al. (2021) повідомляють для вихідної пшениці "
+        f"**X₀={source_x0:.3f}±{source_x0_unc:.3f} кг/кг d.b.**, "
+        f"тобто приблизно **{source_w0:.2f} % w.b.** "
+        "Наша базова модель починається з "
+        f"**X₀={model_x0:.3f} кг/кг d.b.** "
+        f"({float(product['initial_moisture_pct']):.1f} % w.b.)."
     )
 
-    st.warning(
-        "Це числова адаптація класичної Page до змінних T, RH і Xeq. "
-        "За сталих умов вона точно переходить у звичайне рівняння "
-        "Page. Окрема експериментальна валідація саме такої "
-        "покрокової адаптації в Ramaj et al. (2021) не виконувалась, "
-        "тому цей аспект потрібно буде перевірити експериментально."
+    if model_x0 > source_x0 + source_x0_unc:
+        st.warning(
+            "Початкова частина нашого процесу лежить вище "
+            "початкового вологовмісту, на якому виконувалися "
+            "експерименти Ramaj et al. Page усе одно обчислюється, "
+            "але такі зони та інтервали маркуються як екстраполяція "
+            "за початковим станом продукту. Коригувальний коефіцієнт "
+            "не вводиться, оскільки для нього немає експериментального "
+            "обґрунтування."
+        )
+
+    st.markdown("#### 2. Дискретизація камери вздовж потоку")
+
+    zone_count_stage15 = st.number_input(
+        "Кількість розрахункових зон уздовж потоку",
+        min_value=2,
+        max_value=20,
+        value=5,
+        step=1,
+        key="zone_count_stage15",
+    )
+
+    st.caption(
+        "Це чисельна дискретизація, а не кількість лотків. "
+        "Суха речовина продукту рівномірно розподіляється між зонами."
     )
 
     if "heat_mass_transfer_input_profile" not in st.session_state:
@@ -3937,26 +4516,22 @@ with tab_coupled:
         )
     elif "dryer_geometry" not in st.session_state:
         st.warning(
-            "Спочатку задайте геометрію камери у вкладці "
-            "«Геометрія камери і шару»."
+            "Спочатку задайте геометрію сушильної камери."
         )
     else:
         stage15_input = st.session_state[
             "heat_mass_transfer_input_profile"
         ]
 
-        geometry15 = st.session_state["dryer_geometry"]
+        geometry15 = st.session_state[
+            "dryer_geometry"
+        ]
 
         gross_flow_area = float(
             geometry15["gross_flow_area_m2"]
         )
 
-        st.markdown("#### 2. Ефективна площа проходу повітря")
-
-        st.write(
-            "У геометричній моделі вже відома повна площа "
-            "поперечного перерізу основного потоку:"
-        )
+        st.markdown("#### 3. Площа проходу та витрата повітря")
 
         st.latex(
             rf"A_{{\mathrm{{пот,геом}}}}="
@@ -3966,40 +4541,21 @@ with tab_coupled:
         effective_flow_area_m2 = st.number_input(
             "Ефективна вільна площа проходу сушильного агента, м²",
             min_value=0.001,
-            max_value=max(
-                0.001,
-                float(gross_flow_area),
-            ),
+            max_value=max(0.001, gross_flow_area),
             value=float(gross_flow_area),
             step=0.01,
             format="%.4f",
             key="effective_flow_area_stage15_m2",
         )
 
-        st.caption(
-            "За замовчуванням використовується вся геометрична "
-            "площа перерізу. Якщо лотки, напрямні або інші елементи "
-            "зменшують вільний прохід, тут потрібно ввести фактичну "
-            "ефективну площу. Програма не вводить довільний "
-            "коефіцієнт перекриття."
-        )
-
-        st.markdown("#### 3. Витрата сушильного агента")
-
         st.latex(
             r"\dot V_a=v_aA_{\mathrm{еф}}"
         )
 
-        st.latex(
-            r"\dot m_{da}=\rho_{da}\dot V_a"
-        )
-
-        st.markdown("#### 4. Баланс вологи повітря")
-
-        st.latex(
-            r"d_{\mathrm{out}}"
-            r"=d_{\mathrm{in}}"
-            r"+\frac{\dot m_{\mathrm{в}}}{\dot m_{da}}"
+        st.caption(
+            "Поточне значення Aеф залишається конструктивним "
+            "вхідним параметром. Якщо лотки або напрямні перекривають "
+            "частину перерізу, слід ввести реальну вільну площу."
         )
 
         current_balance15 = calculate_mass_balance(
@@ -4009,23 +4565,26 @@ with tab_coupled:
         )
 
         try:
-            coupled_profile, coupled_summary = (
-                simulate_coupled_drying_stage15(
-                    input_profile=stage15_input,
-                    dry_matter_kg=float(
-                        current_balance15["dry_matter_kg"]
-                    ),
-                    initial_x_db=float(
-                        current_balance15["initial_dry_basis"]
-                    ),
-                    target_x_db=float(
-                        current_balance15["final_dry_basis"]
-                    ),
-                    step_minutes=int(model_step_minutes),
-                    effective_flow_area_m2=float(
-                        effective_flow_area_m2
-                    ),
-                )
+            (
+                coupled_profile,
+                coupled_zone_profile,
+                coupled_summary,
+            ) = simulate_zonal_coupled_drying_stage15(
+                input_profile=stage15_input,
+                dry_matter_kg=float(
+                    current_balance15["dry_matter_kg"]
+                ),
+                initial_x_db=float(
+                    current_balance15["initial_dry_basis"]
+                ),
+                target_x_db=float(
+                    current_balance15["final_dry_basis"]
+                ),
+                step_minutes=int(model_step_minutes),
+                effective_flow_area_m2=float(
+                    effective_flow_area_m2
+                ),
+                zone_count=int(zone_count_stage15),
             )
         except Exception as exc:
             st.error(str(exc))
@@ -4035,17 +4594,24 @@ with tab_coupled:
             ] = coupled_profile
 
             st.session_state[
+                "coupled_drying_zone_profile"
+            ] = coupled_zone_profile
+
+            st.session_state[
                 "coupled_drying_summary"
             ] = coupled_summary
 
-            r1, r2, r3, r4 = st.columns(4)
+            m1, m2, m3, m4 = st.columns(4)
 
-            r1.metric(
-                "Кінцева вологість моделі",
-                f"{coupled_summary['final_wb_pct']:.2f} % w.b.",
+            m1.metric(
+                "Кінцева середня вологість",
+                (
+                    f"{coupled_summary['final_average_wb_pct']:.2f} "
+                    "% w.b."
+                ),
             )
 
-            r2.metric(
+            m2.metric(
                 "Видалено води",
                 (
                     f"{coupled_summary['total_water_removed_kg']:.3f} "
@@ -4053,7 +4619,7 @@ with tab_coupled:
                 ),
             )
 
-            r3.metric(
+            m3.metric(
                 "Середня фактична швидкість",
                 (
                     f"{coupled_summary['mean_actual_removal_rate_kg_h']:.4f} "
@@ -4061,40 +4627,133 @@ with tab_coupled:
                 ),
             )
 
-            r4.metric(
-                "Середня витрата повітря",
+            m4.metric(
+                "Середня активна витрата повітря",
                 (
-                    f"{coupled_summary['mean_air_volume_flow_m3_h']:.1f} "
+                    f"{coupled_summary['mean_active_air_volume_flow_m3_h']:.1f} "
                     "м³/год"
                 ),
             )
 
             if coupled_summary["target_reached"]:
                 st.success(
-                    "За заданої тривалості та поточних параметрів "
-                    "Page досягнуто заданої кінцевої вологості."
+                    "Усі розрахункові зони досягли заданої "
+                    "кінцевої вологості. Після цього активний "
+                    "повітряний потік автоматично вимикається."
                 )
+
+                if coupled_summary["target_time"]:
+                    st.write(
+                        "Момент досягнення цілі: "
+                        f"**{coupled_summary['target_time']}**."
+                    )
             else:
                 st.warning(
-                    "За заданої тривалості процесу модель Page "
-                    "не досягла заданої кінцевої вологості. "
-                    "Це важливий результат: цільовий графік п. 10 "
-                    "і фактична кінетична модель не збігаються."
+                    "За заданої тривалості не всі зони досягли "
+                    "кінцевої вологості 13 % w.b."
                 )
 
             st.markdown(
-                "#### Фактична та цільова вологість продукту"
+                "#### 4. Контроль екстраполяції за початковою вологістю"
+            )
+
+            e1, e2 = st.columns(2)
+
+            e1.metric(
+                "Вода, видалена в зоні екстраполяції X₀",
+                (
+                    f"{coupled_summary['source_extrapolated_removed_kg']:.3f} "
+                    "кг"
+                ),
+            )
+
+            e2.metric(
+                "Частка від усієї видаленої води",
+                (
+                    f"{coupled_summary['source_extrapolated_removed_fraction_pct']:.1f} "
+                    "%"
+                ),
+            )
+
+            st.caption(
+                "Під «екстраполяцією X₀» маються на увазі ті "
+                "розрахункові стани, де X > 0,160 кг/кг d.b. "
+                "(0,159+0,001 з вихідного експерименту Ramaj et al.). "
+                "Це не означає, що Page автоматично неправильна, "
+                "але ця частина прогнозу не підтверджена початковим "
+                "вологовмістом вихідного експерименту."
+            )
+
+            st.markdown(
+                "#### 5. Обмеження пропускною здатністю повітря"
+            )
+
+            st.latex(
+                r"\Delta m_{\mathrm{в,факт}}"
+                r"=\min\left("
+                r"\Delta m_{\mathrm{в,Page}},"
+                r"\dot m_{da}\Delta t"
+                r"(d_{\mathrm{sat,ad}}-d_{\mathrm{in}})"
+                r"\right)"
+            )
+
+            a1, a2 = st.columns(2)
+
+            a1.metric(
+                "Інтервали з обмеженням повітрям",
+                str(
+                    coupled_summary[
+                        "air_capacity_limited_intervals"
+                    ]
+                ),
+            )
+
+            a2.metric(
+                "Скорочення видалення води через межу насичення",
+                (
+                    f"{coupled_summary['air_capacity_limited_water_difference_kg']:.3f} "
+                    "кг"
+                ),
+            )
+
+            st.write(
+                "Тепер Page не може вимагати від повітря перенести "
+                "більше води, ніж воно фізично здатне втримати у "
+                "паровій фазі до адіабатичного насичення."
+            )
+
+            if (
+                coupled_summary[
+                    "page_rh_extrapolated_intervals"
+                ] > 0
+            ):
+                st.warning(
+                    "Також залишаються інтервали з екстраполяцією "
+                    "Page за RH поза 20–60 %. Вони продовжують "
+                    "маркуватися окремо."
+                )
+
+            if coupled_summary["unusable_intervals"] > 0:
+                st.error(
+                    "Є інтервали, у яких хоча б одна зона вийшла "
+                    "за область Modified Oswin або за допустимі "
+                    "T/v узагальненої Page. Для такої зони сушіння "
+                    "в цьому інтервалі не обчислюється."
+                )
+
+            st.markdown(
+                "#### 6. Порівняння з цільовою траєкторією"
             )
 
             comparison_df = pd.DataFrame(
                 index=coupled_profile.index
             )
 
-            comparison_df["Page, % w.b."] = (
-                coupled_profile[
-                    "actual_moisture_end_wb_pct"
-                ]
-            )
+            comparison_df[
+                "Зональна Page, % w.b."
+            ] = coupled_profile[
+                "zonal_average_moisture_end_wb_pct"
+            ]
 
             if (
                 "required_moisture_removal_profile"
@@ -4120,7 +4779,7 @@ with tab_coupled:
             )
 
             st.markdown(
-                "#### Фактична швидкість видалення води"
+                "#### 7. Фактична швидкість видалення води"
             )
 
             st.line_chart(
@@ -4131,7 +4790,7 @@ with tab_coupled:
             )
 
             st.markdown(
-                "#### Витрата сушильного агента"
+                "#### 8. Витрата сушильного агента"
             )
 
             st.line_chart(
@@ -4141,97 +4800,93 @@ with tab_coupled:
                 use_container_width=True,
             )
 
-            st.markdown(
-                "#### Вологовміст сушильного агента на вході і виході"
+            st.write(
+                "Після досягнення кінцевої вологості всіма зонами "
+                "витрата активного сушіння автоматично стає нульовою. "
+                "Нічний захисний режим буде сформований окремо."
             )
 
-            humidity_air_chart = pd.DataFrame(
+            st.markdown(
+                "#### 9. Зміна стану повітря вздовж камери"
+            )
+
+            air_chart = pd.DataFrame(
                 index=coupled_profile.index
             )
-            humidity_air_chart["d вхід, г/кг"] = (
+
+            air_chart["d вхід, г/кг"] = (
                 coupled_profile[
-                    "humidity_ratio_kg_kg"
+                    "zonal_air_inlet_humidity_ratio_kg_kg"
                 ] * 1000.0
             )
-            humidity_air_chart["d вихід, г/кг"] = (
+
+            air_chart["d вихід, г/кг"] = (
                 coupled_profile[
-                    "drying_air_outlet_humidity_ratio_g_kg"
+                    "zonal_air_outlet_humidity_ratio_g_kg"
                 ]
             )
 
             st.line_chart(
-                humidity_air_chart,
+                air_chart,
                 use_container_width=True,
             )
 
             st.markdown(
-                "#### Діагностична оцінка стану повітря на виході"
+                "#### 10. Деталізація по розрахункових зонах"
             )
 
-            st.warning(
-                "Температура і RH на виході нижче визначаються "
-                "за адіабатичним наближенням h_out=h_in. "
-                "Це не остаточний тепловий баланс сушильної камери. "
-                "Після розрахунку теплоти на нагрівання продукту, "
-                "випаровування, конструкцій і втрат цей блок "
-                "потрібно буде уточнити."
-            )
+            if not coupled_zone_profile.empty:
+                st.dataframe(
+                    coupled_zone_profile,
+                    use_container_width=True,
+                )
 
-            outlet_chart = coupled_profile[
-                [
-                    "diagnostic_adiabatic_outlet_temp_c",
-                    "diagnostic_adiabatic_outlet_rh_pct",
-                ]
-            ]
-
-            st.dataframe(
-                coupled_profile[
-                    [
-                        "operating_mode",
-                        "actual_x_start_db_kg_kg",
-                        "actual_x_end_db_kg_kg",
-                        "actual_moisture_end_wb_pct",
-                        "actual_water_removed_interval_kg",
-                        "actual_water_removal_rate_kg_h",
-                        "dry_air_mass_flow_kg_h",
-                        "drying_air_volume_flow_m3_h",
-                        "humidity_ratio_kg_kg",
-                        "drying_air_outlet_humidity_ratio_kg_kg",
-                        "diagnostic_adiabatic_outlet_temp_c",
-                        "diagnostic_adiabatic_outlet_rh_pct",
-                        "drying_model_status",
-                    ]
-                ],
-                use_container_width=True,
-            )
-
-            if coupled_summary[
-                "supersaturated_intervals"
-            ] > 0:
-                st.error(
-                    "Адіабатична діагностична оцінка дала RH>100 % "
-                    f"для {coupled_summary['supersaturated_intervals']} "
-                    "інтервалів. Це означає, що за поточної витрати "
-                    "повітря спрощений баланс не може фізично "
-                    "утримати всю розраховану вологу у паровій фазі. "
-                    "Потрібно збільшити ефективну площу/витрату "
-                    "повітря або уточнити тепловий баланс."
+                st.write(
+                    "У цій таблиці видно, що кожна наступна зона "
+                    "отримує вже змінені T, RH і d після попередньої "
+                    "зони. Саме цього не було в попередній "
+                    "однозонній версії."
                 )
 
             st.download_button(
-                "Завантажити спільний розрахунок сушіння",
+                "Завантажити часовий ряд зональної моделі",
                 data=dataframe_to_csv_bytes(
                     coupled_profile
                 ),
-                file_name="coupled_drying_stage15.csv",
+                file_name=(
+                    "zonal_coupled_drying_stage15.csv"
+                ),
                 mime="text/csv",
                 use_container_width=True,
-                key="download_coupled_stage15",
+                key="download_zonal_coupled_stage15",
+            )
+
+            if not coupled_zone_profile.empty:
+                st.download_button(
+                    "Завантажити деталізацію по зонах",
+                    data=dataframe_to_csv_bytes(
+                        coupled_zone_profile
+                    ),
+                    file_name=(
+                        "zonal_coupled_drying_details.csv"
+                    ),
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_zonal_details_stage15",
+                )
+
+            st.warning(
+                "Навіть після цих уточнень результат вище X₀≈0,159 "
+                "кг/кг d.b. залишається екстраполяцією Page, а "
+                "адіабатичне охолодження ще не враховує нагрівання "
+                "самого зерна, конструкцій і теплові втрати. "
+                "Ці складові будуть введені на теплових етапах."
             )
 
             st.info(
-                "Наступний етап — пункт 16: перевірити, чи "
-                "забезпечує фактична кінетика потрібну швидкість "
-                "видалення води та задану кінцеву вологість."
+                "Наступний етап — пункт 16: кількісно порівняти "
+                "фактичний зональний режим із потрібною швидкістю "
+                "видалення води та оцінити запас/дефіцит "
+                "продуктивності сушарки."
             )
 
