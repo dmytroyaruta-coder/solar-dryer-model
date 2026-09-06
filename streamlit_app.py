@@ -1455,6 +1455,452 @@ def prepare_heat_mass_transfer_inputs(
 
     return result, summary
 
+
+def calculate_dry_air_density_kg_m3(
+    temperature_c,
+    humidity_ratio_kg_kg,
+    pressure_kpa,
+):
+    """
+    Густина саме сухої складової вологого повітря, кг сухого
+    повітря/м³ вологого повітря.
+    """
+    t_k = pd.Series(temperature_c, dtype="float64") + 273.15
+    w = pd.Series(humidity_ratio_kg_kg, dtype="float64")
+    p = pd.Series(pressure_kpa, dtype="float64")
+
+    p_v = w * p / (0.621945 + w)
+    p_da_pa = (p - p_v) * 1000.0
+
+    return p_da_pa / (287.055 * t_k)
+
+
+def moist_air_enthalpy_kj_kg_da(
+    temperature_c,
+    humidity_ratio_kg_kg,
+):
+    """
+    Ентальпія вологого повітря, кДж/кг сухого повітря.
+    """
+    t = pd.Series(temperature_c, dtype="float64")
+    w = pd.Series(humidity_ratio_kg_kg, dtype="float64")
+
+    return 1.006 * t + w * (2501.0 + 1.86 * t)
+
+
+def temperature_from_enthalpy_and_humidity_ratio(
+    enthalpy_kj_kg_da,
+    humidity_ratio_kg_kg,
+):
+    """
+    Температура вологого повітря з рівняння ентальпії:
+        h = 1.006*T + d*(2501 + 1.86*T)
+
+    Використовується лише для діагностичної адіабатичної оцінки
+    стану повітря на виході.
+    """
+    h = pd.Series(enthalpy_kj_kg_da, dtype="float64")
+    w = pd.Series(humidity_ratio_kg_kg, dtype="float64")
+
+    return (h - 2501.0 * w) / (1.006 + 1.86 * w)
+
+
+def simulate_coupled_drying_stage15(
+    input_profile: pd.DataFrame,
+    dry_matter_kg: float,
+    initial_x_db: float,
+    target_x_db: float,
+    step_minutes: int,
+    effective_flow_area_m2: float,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """
+    Етап 15.
+
+    1. Фактичний X(t) розраховується за узагальненою Page.
+    2. Для змінних умов Page інтегрується покроково:
+       X_(i+1) = Xeq_i + (X_i - Xeq_i) *
+                 exp[-k_i * ((tau+dt)^n - tau^n)]
+
+       Це числова адаптація Page до змінних умов. Вона точно
+       відтворює класичну Page за сталих k та Xeq, але сама
+       адаптація до змінних умов не була окремо валідована
+       Ramaj et al. (2021).
+
+    3. Об'ємна витрата повітря визначається:
+       Vdot = v * A_eff
+
+    4. Масова витрата сухого повітря:
+       mdot_da = rho_da * Vdot
+
+    5. Вологовміст на виході з балансу води:
+       d_out = d_in + mdot_evap / mdot_da
+
+    6. Для діагностичної оцінки T_out та RH_out використовується
+       адіабатичне наближення h_out = h_in. Це ще не остаточний
+       тепловий баланс сушильної камери.
+    """
+    import numpy as np
+
+    required = {
+        "operating_mode",
+        "drying_air_temperature_c",
+        "drying_air_inlet_rh_pct",
+        "humidity_ratio_kg_kg",
+        "PS",
+        "air_velocity_m_s",
+        "equilibrium_moisture_db_kg_kg",
+        "page_k_min_inv",
+        "page_n",
+        "drying_model_status",
+    }
+
+    missing = required - set(input_profile.columns)
+    if missing:
+        raise ValueError(
+            "Для етапу 15 відсутні параметри: "
+            + ", ".join(sorted(missing))
+        )
+
+    if effective_flow_area_m2 <= 0:
+        raise ValueError(
+            "Ефективна площа проходу сушильного агента має бути > 0."
+        )
+
+    if dry_matter_kg <= 0:
+        raise ValueError("Маса сухої речовини має бути > 0.")
+
+    if target_x_db >= initial_x_db:
+        raise ValueError(
+            "Кінцевий вологовміст має бути меншим за початковий."
+        )
+
+    result = input_profile.copy()
+
+    n_rows = len(result)
+
+    x_start = np.full(n_rows, np.nan, dtype=float)
+    x_end = np.full(n_rows, np.nan, dtype=float)
+    moisture_removed_interval = np.zeros(n_rows, dtype=float)
+    moisture_removal_rate_kg_h = np.zeros(n_rows, dtype=float)
+    active_time_start_min = np.zeros(n_rows, dtype=float)
+    active_time_end_min = np.zeros(n_rows, dtype=float)
+    target_reached = np.zeros(n_rows, dtype=bool)
+
+    current_x = float(initial_x_db)
+    active_time_min = 0.0
+
+    dt_min = float(step_minutes)
+    dt_h = dt_min / 60.0
+
+    for pos in range(n_rows):
+        row = result.iloc[pos]
+
+        x_start[pos] = current_x
+        active_time_start_min[pos] = active_time_min
+
+        is_day = row["operating_mode"] == "Денний режим"
+        status = row["drying_model_status"]
+
+        can_dry = (
+            is_day
+            and status in ("validated", "page_rh_extrapolation")
+            and pd.notna(row["page_k_min_inv"])
+            and pd.notna(row["page_n"])
+            and pd.notna(row["equilibrium_moisture_db_kg_kg"])
+            and current_x > target_x_db
+        )
+
+        if can_dry:
+            k = float(row["page_k_min_inv"])
+            n = float(row["page_n"])
+            xeq = float(
+                row["equilibrium_moisture_db_kg_kg"]
+            )
+
+            # Якщо X <= Xeq, рушійної сили сушіння немає.
+            if current_x > xeq:
+                exponent_increment = (
+                    k
+                    * (
+                        (active_time_min + dt_min) ** n
+                        - active_time_min ** n
+                    )
+                )
+
+                predicted_x = (
+                    xeq
+                    + (current_x - xeq)
+                    * np.exp(-exponent_increment)
+                )
+
+                # Не дозволяємо моделі перейти нижче заданої
+                # кінцевої вологості користувача.
+                next_x = max(
+                    float(target_x_db),
+                    float(predicted_x),
+                )
+            else:
+                next_x = current_x
+
+            active_time_min += dt_min
+        else:
+            next_x = current_x
+
+        x_end[pos] = next_x
+        active_time_end_min[pos] = active_time_min
+
+        removed_kg = max(
+            0.0,
+            dry_matter_kg * (current_x - next_x),
+        )
+
+        moisture_removed_interval[pos] = removed_kg
+
+        if dt_h > 0:
+            moisture_removal_rate_kg_h[pos] = (
+                removed_kg / dt_h
+            )
+
+        if next_x <= target_x_db + 1e-12:
+            target_reached[pos] = True
+
+        current_x = next_x
+
+    result["actual_x_start_db_kg_kg"] = x_start
+    result["actual_x_end_db_kg_kg"] = x_end
+
+    result["actual_moisture_start_wb_pct"] = (
+        result["actual_x_start_db_kg_kg"]
+        / (1.0 + result["actual_x_start_db_kg_kg"])
+        * 100.0
+    )
+
+    result["actual_moisture_end_wb_pct"] = (
+        result["actual_x_end_db_kg_kg"]
+        / (1.0 + result["actual_x_end_db_kg_kg"])
+        * 100.0
+    )
+
+    result["active_drying_time_start_min"] = (
+        active_time_start_min
+    )
+    result["active_drying_time_end_min"] = (
+        active_time_end_min
+    )
+
+    result["actual_water_removed_interval_kg"] = (
+        moisture_removed_interval
+    )
+
+    result["actual_water_removal_rate_kg_h"] = (
+        moisture_removal_rate_kg_h
+    )
+
+    result["target_final_moisture_reached"] = (
+        target_reached
+    )
+
+    # -------------------------------------------------------------
+    # Air flow from geometry and velocity
+    # -------------------------------------------------------------
+    result["effective_flow_area_m2"] = float(
+        effective_flow_area_m2
+    )
+
+    result["drying_air_volume_flow_m3_s"] = (
+        pd.to_numeric(
+            result["air_velocity_m_s"],
+            errors="coerce",
+        )
+        * float(effective_flow_area_m2)
+    )
+
+    result["drying_air_volume_flow_m3_h"] = (
+        result["drying_air_volume_flow_m3_s"] * 3600.0
+    )
+
+    dry_air_density = calculate_dry_air_density_kg_m3(
+        temperature_c=result["drying_air_temperature_c"],
+        humidity_ratio_kg_kg=result["humidity_ratio_kg_kg"],
+        pressure_kpa=result["PS"],
+    )
+    dry_air_density.index = result.index
+
+    result["dry_air_density_kg_m3"] = dry_air_density
+
+    result["dry_air_mass_flow_kg_s"] = (
+        result["drying_air_volume_flow_m3_s"]
+        * result["dry_air_density_kg_m3"]
+    )
+
+    result["dry_air_mass_flow_kg_h"] = (
+        result["dry_air_mass_flow_kg_s"] * 3600.0
+    )
+
+    # Night mode is not treated as active drying in the present model.
+    day_mask = result["operating_mode"] == "Денний режим"
+
+    result.loc[
+        ~day_mask,
+        [
+            "drying_air_volume_flow_m3_s",
+            "drying_air_volume_flow_m3_h",
+            "dry_air_mass_flow_kg_s",
+            "dry_air_mass_flow_kg_h",
+        ],
+    ] = 0.0
+
+    # -------------------------------------------------------------
+    # Moisture balance of drying air
+    # -------------------------------------------------------------
+    result["actual_water_removal_rate_kg_s"] = (
+        result["actual_water_removal_rate_kg_h"] / 3600.0
+    )
+
+    result["drying_air_outlet_humidity_ratio_kg_kg"] = (
+        result["humidity_ratio_kg_kg"]
+    )
+
+    positive_air_flow = (
+        result["dry_air_mass_flow_kg_s"] > 0
+    )
+
+    result.loc[
+        positive_air_flow,
+        "drying_air_outlet_humidity_ratio_kg_kg",
+    ] = (
+        result.loc[
+            positive_air_flow,
+            "humidity_ratio_kg_kg",
+        ]
+        + result.loc[
+            positive_air_flow,
+            "actual_water_removal_rate_kg_s",
+        ]
+        / result.loc[
+            positive_air_flow,
+            "dry_air_mass_flow_kg_s",
+        ]
+    )
+
+    result["drying_air_outlet_humidity_ratio_g_kg"] = (
+        result["drying_air_outlet_humidity_ratio_kg_kg"]
+        * 1000.0
+    )
+
+    # -------------------------------------------------------------
+    # Diagnostic adiabatic outlet state
+    # -------------------------------------------------------------
+    h_in = moist_air_enthalpy_kj_kg_da(
+        temperature_c=result["drying_air_temperature_c"],
+        humidity_ratio_kg_kg=result["humidity_ratio_kg_kg"],
+    )
+    h_in.index = result.index
+
+    result["drying_air_inlet_enthalpy_kj_kg_da"] = h_in
+
+    outlet_t = temperature_from_enthalpy_and_humidity_ratio(
+        enthalpy_kj_kg_da=h_in,
+        humidity_ratio_kg_kg=(
+            result[
+                "drying_air_outlet_humidity_ratio_kg_kg"
+            ]
+        ),
+    )
+    outlet_t.index = result.index
+
+    result["diagnostic_adiabatic_outlet_temp_c"] = (
+        outlet_t
+    )
+
+    outlet_rh = relative_humidity_from_humidity_ratio(
+        temperature_c=outlet_t,
+        humidity_ratio_kg_kg=(
+            result[
+                "drying_air_outlet_humidity_ratio_kg_kg"
+            ]
+        ),
+        pressure_kpa=result["PS"],
+    )
+    outlet_rh.index = result.index
+
+    result["diagnostic_adiabatic_outlet_rh_pct"] = (
+        outlet_rh
+    )
+
+    result["diagnostic_outlet_supersaturation"] = (
+        result["diagnostic_adiabatic_outlet_rh_pct"] > 100.0
+    )
+
+    # Night mode: outlet state not defined in this active-drying step.
+    result.loc[
+        ~day_mask,
+        [
+            "drying_air_outlet_humidity_ratio_kg_kg",
+            "drying_air_outlet_humidity_ratio_g_kg",
+            "drying_air_inlet_enthalpy_kj_kg_da",
+            "diagnostic_adiabatic_outlet_temp_c",
+            "diagnostic_adiabatic_outlet_rh_pct",
+        ],
+    ] = pd.NA
+
+    final_x = float(result["actual_x_end_db_kg_kg"].iloc[-1])
+
+    total_removed_kg = float(
+        result["actual_water_removed_interval_kg"].sum()
+    )
+
+    active_rates = result.loc[
+        result["actual_water_removal_rate_kg_h"] > 0,
+        "actual_water_removal_rate_kg_h",
+    ]
+
+    day_air = result.loc[
+        day_mask & (result["dry_air_mass_flow_kg_h"] > 0)
+    ]
+
+    summary = {
+        "initial_x_db": float(initial_x_db),
+        "target_x_db": float(target_x_db),
+        "final_x_db": final_x,
+        "final_wb_pct": (
+            final_x / (1.0 + final_x) * 100.0
+        ),
+        "total_water_removed_kg": total_removed_kg,
+        "mean_actual_removal_rate_kg_h": (
+            float(active_rates.mean())
+            if not active_rates.empty
+            else 0.0
+        ),
+        "max_actual_removal_rate_kg_h": (
+            float(active_rates.max())
+            if not active_rates.empty
+            else 0.0
+        ),
+        "mean_dry_air_mass_flow_kg_h": (
+            float(day_air["dry_air_mass_flow_kg_h"].mean())
+            if not day_air.empty
+            else 0.0
+        ),
+        "mean_air_volume_flow_m3_h": (
+            float(
+                day_air["drying_air_volume_flow_m3_h"].mean()
+            )
+            if not day_air.empty
+            else 0.0
+        ),
+        "target_reached": bool(
+            (result["actual_x_end_db_kg_kg"] <= target_x_db + 1e-12).any()
+        ),
+        "supersaturated_intervals": int(
+            result[
+                "diagnostic_outlet_supersaturation"
+            ].fillna(False).sum()
+        ),
+    }
+
+    return result, summary
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -1483,7 +1929,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -1494,6 +1940,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "7. Кінетична модель сушіння",
         "8. Рівноважна вологість",
         "9. Тепло- і масообмін",
+        "10. Спільний розрахунок сушіння",
     ]
 )
 
@@ -3443,8 +3890,348 @@ with tab_heat_mass:
         "повітря на виході переноситься на етап 15."
     )
 
-    st.info(
-        "Наступний етап — пункт 15: сумісне визначення фактичної "
-        "швидкості сушіння, витрати сушильного агента та стану "
-        "повітря на виході із сушильної камери."
+# ---------------------------------------------------------------------
+# 10. СПІЛЬНИЙ РОЗРАХУНОК СУШІННЯ
+# ---------------------------------------------------------------------
+with tab_coupled:
+    st.subheader(
+        "Етап 15. Фактична швидкість сушіння, витрата "
+        "сушильного агента та стан повітря на виході"
     )
+
+    st.info(
+        "На цьому етапі вперше виконується покроковий числовий "
+        "розрахунок фактичного вологовмісту продукту за Page. "
+        "Одночасно через геометрію камери та швидкість повітря "
+        "визначається витрата сушильного агента, а за балансом "
+        "вологи — його вологовміст на виході."
+    )
+
+    st.markdown("#### 1. Покрокова Page-модель")
+
+    st.latex(
+        r"X_{i+1}=X_{\mathrm{eq},i}"
+        r"+\left(X_i-X_{\mathrm{eq},i}\right)"
+        r"\exp\left\{-k_i"
+        r"\left[(\tau_i+\Delta t)^n-\tau_i^n\right]\right\}"
+    )
+
+    st.write(
+        "Тут τ — накопичений час саме активного денного сушіння. "
+        "У нічному режимі він не збільшується, а X залишається "
+        "незмінним у поточній версії моделі."
+    )
+
+    st.warning(
+        "Це числова адаптація класичної Page до змінних T, RH і Xeq. "
+        "За сталих умов вона точно переходить у звичайне рівняння "
+        "Page. Окрема експериментальна валідація саме такої "
+        "покрокової адаптації в Ramaj et al. (2021) не виконувалась, "
+        "тому цей аспект потрібно буде перевірити експериментально."
+    )
+
+    if "heat_mass_transfer_input_profile" not in st.session_state:
+        st.warning(
+            "Спочатку виконайте етап 14 у вкладці "
+            "«Тепло- і масообмін»."
+        )
+    elif "dryer_geometry" not in st.session_state:
+        st.warning(
+            "Спочатку задайте геометрію камери у вкладці "
+            "«Геометрія камери і шару»."
+        )
+    else:
+        stage15_input = st.session_state[
+            "heat_mass_transfer_input_profile"
+        ]
+
+        geometry15 = st.session_state["dryer_geometry"]
+
+        gross_flow_area = float(
+            geometry15["gross_flow_area_m2"]
+        )
+
+        st.markdown("#### 2. Ефективна площа проходу повітря")
+
+        st.write(
+            "У геометричній моделі вже відома повна площа "
+            "поперечного перерізу основного потоку:"
+        )
+
+        st.latex(
+            rf"A_{{\mathrm{{пот,геом}}}}="
+            rf"{gross_flow_area:.4f}\ \mathrm{{м^2}}"
+        )
+
+        effective_flow_area_m2 = st.number_input(
+            "Ефективна вільна площа проходу сушильного агента, м²",
+            min_value=0.001,
+            max_value=max(
+                0.001,
+                float(gross_flow_area),
+            ),
+            value=float(gross_flow_area),
+            step=0.01,
+            format="%.4f",
+            key="effective_flow_area_stage15_m2",
+        )
+
+        st.caption(
+            "За замовчуванням використовується вся геометрична "
+            "площа перерізу. Якщо лотки, напрямні або інші елементи "
+            "зменшують вільний прохід, тут потрібно ввести фактичну "
+            "ефективну площу. Програма не вводить довільний "
+            "коефіцієнт перекриття."
+        )
+
+        st.markdown("#### 3. Витрата сушильного агента")
+
+        st.latex(
+            r"\dot V_a=v_aA_{\mathrm{еф}}"
+        )
+
+        st.latex(
+            r"\dot m_{da}=\rho_{da}\dot V_a"
+        )
+
+        st.markdown("#### 4. Баланс вологи повітря")
+
+        st.latex(
+            r"d_{\mathrm{out}}"
+            r"=d_{\mathrm{in}}"
+            r"+\frac{\dot m_{\mathrm{в}}}{\dot m_{da}}"
+        )
+
+        current_balance15 = calculate_mass_balance(
+            float(initial_mass_kg),
+            float(product["initial_moisture_pct"]),
+            float(product["final_moisture_pct"]),
+        )
+
+        try:
+            coupled_profile, coupled_summary = (
+                simulate_coupled_drying_stage15(
+                    input_profile=stage15_input,
+                    dry_matter_kg=float(
+                        current_balance15["dry_matter_kg"]
+                    ),
+                    initial_x_db=float(
+                        current_balance15["initial_dry_basis"]
+                    ),
+                    target_x_db=float(
+                        current_balance15["final_dry_basis"]
+                    ),
+                    step_minutes=int(model_step_minutes),
+                    effective_flow_area_m2=float(
+                        effective_flow_area_m2
+                    ),
+                )
+            )
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.session_state[
+                "coupled_drying_profile"
+            ] = coupled_profile
+
+            st.session_state[
+                "coupled_drying_summary"
+            ] = coupled_summary
+
+            r1, r2, r3, r4 = st.columns(4)
+
+            r1.metric(
+                "Кінцева вологість моделі",
+                f"{coupled_summary['final_wb_pct']:.2f} % w.b.",
+            )
+
+            r2.metric(
+                "Видалено води",
+                (
+                    f"{coupled_summary['total_water_removed_kg']:.3f} "
+                    "кг"
+                ),
+            )
+
+            r3.metric(
+                "Середня фактична швидкість",
+                (
+                    f"{coupled_summary['mean_actual_removal_rate_kg_h']:.4f} "
+                    "кг/год"
+                ),
+            )
+
+            r4.metric(
+                "Середня витрата повітря",
+                (
+                    f"{coupled_summary['mean_air_volume_flow_m3_h']:.1f} "
+                    "м³/год"
+                ),
+            )
+
+            if coupled_summary["target_reached"]:
+                st.success(
+                    "За заданої тривалості та поточних параметрів "
+                    "Page досягнуто заданої кінцевої вологості."
+                )
+            else:
+                st.warning(
+                    "За заданої тривалості процесу модель Page "
+                    "не досягла заданої кінцевої вологості. "
+                    "Це важливий результат: цільовий графік п. 10 "
+                    "і фактична кінетична модель не збігаються."
+                )
+
+            st.markdown(
+                "#### Фактична та цільова вологість продукту"
+            )
+
+            comparison_df = pd.DataFrame(
+                index=coupled_profile.index
+            )
+
+            comparison_df["Page, % w.b."] = (
+                coupled_profile[
+                    "actual_moisture_end_wb_pct"
+                ]
+            )
+
+            if (
+                "required_moisture_removal_profile"
+                in st.session_state
+            ):
+                target_profile15 = st.session_state[
+                    "required_moisture_removal_profile"
+                ]
+
+                if (
+                    len(target_profile15)
+                    == len(comparison_df)
+                ):
+                    comparison_df[
+                        "Цільова траєкторія, % w.b."
+                    ] = target_profile15[
+                        "target_product_moisture_wb_pct"
+                    ].to_numpy()
+
+            st.line_chart(
+                comparison_df,
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Фактична швидкість видалення води"
+            )
+
+            st.line_chart(
+                coupled_profile[
+                    ["actual_water_removal_rate_kg_h"]
+                ],
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Витрата сушильного агента"
+            )
+
+            st.line_chart(
+                coupled_profile[
+                    ["drying_air_volume_flow_m3_h"]
+                ],
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Вологовміст сушильного агента на вході і виході"
+            )
+
+            humidity_air_chart = pd.DataFrame(
+                index=coupled_profile.index
+            )
+            humidity_air_chart["d вхід, г/кг"] = (
+                coupled_profile[
+                    "humidity_ratio_kg_kg"
+                ] * 1000.0
+            )
+            humidity_air_chart["d вихід, г/кг"] = (
+                coupled_profile[
+                    "drying_air_outlet_humidity_ratio_g_kg"
+                ]
+            )
+
+            st.line_chart(
+                humidity_air_chart,
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Діагностична оцінка стану повітря на виході"
+            )
+
+            st.warning(
+                "Температура і RH на виході нижче визначаються "
+                "за адіабатичним наближенням h_out=h_in. "
+                "Це не остаточний тепловий баланс сушильної камери. "
+                "Після розрахунку теплоти на нагрівання продукту, "
+                "випаровування, конструкцій і втрат цей блок "
+                "потрібно буде уточнити."
+            )
+
+            outlet_chart = coupled_profile[
+                [
+                    "diagnostic_adiabatic_outlet_temp_c",
+                    "diagnostic_adiabatic_outlet_rh_pct",
+                ]
+            ]
+
+            st.dataframe(
+                coupled_profile[
+                    [
+                        "operating_mode",
+                        "actual_x_start_db_kg_kg",
+                        "actual_x_end_db_kg_kg",
+                        "actual_moisture_end_wb_pct",
+                        "actual_water_removed_interval_kg",
+                        "actual_water_removal_rate_kg_h",
+                        "dry_air_mass_flow_kg_h",
+                        "drying_air_volume_flow_m3_h",
+                        "humidity_ratio_kg_kg",
+                        "drying_air_outlet_humidity_ratio_kg_kg",
+                        "diagnostic_adiabatic_outlet_temp_c",
+                        "diagnostic_adiabatic_outlet_rh_pct",
+                        "drying_model_status",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+            if coupled_summary[
+                "supersaturated_intervals"
+            ] > 0:
+                st.error(
+                    "Адіабатична діагностична оцінка дала RH>100 % "
+                    f"для {coupled_summary['supersaturated_intervals']} "
+                    "інтервалів. Це означає, що за поточної витрати "
+                    "повітря спрощений баланс не може фізично "
+                    "утримати всю розраховану вологу у паровій фазі. "
+                    "Потрібно збільшити ефективну площу/витрату "
+                    "повітря або уточнити тепловий баланс."
+                )
+
+            st.download_button(
+                "Завантажити спільний розрахунок сушіння",
+                data=dataframe_to_csv_bytes(
+                    coupled_profile
+                ),
+                file_name="coupled_drying_stage15.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_coupled_stage15",
+            )
+
+            st.info(
+                "Наступний етап — пункт 16: перевірити, чи "
+                "забезпечує фактична кінетика потрібну швидкість "
+                "видалення води та задану кінцеву вологість."
+            )
+
