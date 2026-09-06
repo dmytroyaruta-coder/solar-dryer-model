@@ -962,6 +962,18 @@ def calculate_dryer_geometry(
         "bulk_density_difference_pct": (
             bulk_density_difference_pct
         ),
+        # Початкові геометричні параметри зберігаються окремо,
+        # щоб наступні етапи могли коректно пов'язувати локальну
+        # швидкість повітря в шарі з реальною витратою вентилятора.
+        "tray_count": int(tray_count),
+        "tray_length_m": float(tray_length_m),
+        "tray_width_m": float(tray_width_m),
+        "layer_thickness_m": float(layer_thickness_m),
+        "tray_pitch_m": float(tray_pitch_m),
+        "airflow_direction": airflow_direction,
+        "chamber_length_m": float(chamber_length_m),
+        "chamber_width_m": float(chamber_width_m),
+        "chamber_height_m": float(chamber_height_m),
     }
 
 
@@ -1722,42 +1734,41 @@ def simulate_zonal_coupled_drying_stage15(
     initial_x_db: float,
     target_x_db: float,
     step_minutes: int,
-    effective_flow_area_m2: float,
+    active_flow_area_per_path_m2: float,
+    parallel_path_count: int,
     zone_count: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
     """
-    Improved stage 15.
+    Improved stage 15 with a physically explicit linkage:
 
-    Key changes compared with the previous lumped calculation:
+        v_Page  <->  active product-flow area  <->  fan flow
 
-    1. The product is divided into sequential computational zones
-       along the airflow path.
+    Ramaj et al. (2021) measured drying-air velocity in a column
+    upstream of a sample holder with a perforated bottom so that air
+    flowed through the pore volume of the wheat kernels. Therefore,
+    v used in the Page correlation is treated here as a LOCAL
+    superficial velocity through the representative product-flow path,
+    not as an automatic velocity through the full chamber cross-section.
 
-    2. Air passes zone 1 -> zone 2 -> ... -> zone N. Moisture added
-       in an upstream zone therefore increases d and RH and, under
-       the adiabatic diagnostic approximation, reduces T before the
-       air reaches the next zone.
+    For one representative path:
+        Vdot_path = v_Page * A_path
 
-    3. Page is evaluated with the LOCAL inlet T and RH of each zone.
+    For N identical parallel paths:
+        Vdot_fan = N * Vdot_path
 
-    4. Ramaj et al. used wheat with X0 = 0.159 ± 0.001 kg/kg d.b.
-       If the current zone moisture is above 0.160 kg/kg d.b.,
-       the use of Page is explicitly flagged as extrapolation with
-       respect to the source experiment's initial moisture level.
-       No invented correction factor is applied.
+    The representative path contains:
+        m_dry,path = m_dry,total / N
 
-    5. Page-predicted water removal is limited by the maximum amount
-       of water that the airflow can carry to the adiabatic saturation
-       state over the time step. This prevents RH > 100 % by
-       construction and couples drying rate to airflow capacity.
+    The air is propagated serially through computational zones inside
+    that representative path. Results are then scaled by N identical
+    parallel paths.
 
-    6. Active airflow stops automatically after ALL zones reach the
-       specified final moisture target.
+    This allows:
+    - one serial air path through all trays: N = 1;
+    - parallel air distribution between trays: N = number of trays;
+    - any other justified number of identical parallel branches.
 
-    Important:
-    The serial-zone/variable-condition adaptation is a numerical
-    extension of the source Page model. It must later be validated
-    against the experiment of the dissertation.
+    No arbitrary "chamber cross-section = Page area" assumption is used.
     """
     import math
     import numpy as np
@@ -1787,9 +1798,14 @@ def simulate_zonal_coupled_drying_stage15(
             "Кінцевий вологовміст має бути меншим за початковий."
         )
 
-    if effective_flow_area_m2 <= 0:
+    if active_flow_area_per_path_m2 <= 0:
         raise ValueError(
-            "Ефективна площа проходу повітря має бути > 0."
+            "Активна площа проходу через продукт має бути > 0."
+        )
+
+    if parallel_path_count < 1:
+        raise ValueError(
+            "Кількість паралельних повітряних трактів має бути >= 1."
         )
 
     if zone_count < 2:
@@ -1804,9 +1820,16 @@ def simulate_zonal_coupled_drying_stage15(
     result = input_profile.copy()
     n_rows = len(result)
 
-    dry_mass_zone = float(dry_matter_kg) / int(zone_count)
+    n_parallel = int(parallel_path_count)
+    area_path = float(active_flow_area_per_path_m2)
+    area_total = area_path * n_parallel
 
-    # State of every product zone.
+    # Representative path carries an equal fraction of the product.
+    dry_mass_path = float(dry_matter_kg) / n_parallel
+    dry_mass_zone = dry_mass_path / int(zone_count)
+
+    # Each parallel path is assumed identical, so one path can be
+    # simulated and then multiplied by N for total water removal.
     x_zone = np.full(
         int(zone_count),
         float(initial_x_db),
@@ -1825,17 +1848,18 @@ def simulate_zonal_coupled_drying_stage15(
         + source_initial_x_uncertainty
     )
 
-    # Time-series outputs.
     avg_x_start = np.full(n_rows, np.nan)
     avg_x_end = np.full(n_rows, np.nan)
-
     avg_wb_end = np.full(n_rows, np.nan)
 
     total_removed_interval = np.zeros(n_rows)
     removal_rate_kg_h = np.zeros(n_rows)
 
-    air_volume_flow_m3_h = np.zeros(n_rows)
-    dry_air_mass_flow_kg_h = np.zeros(n_rows)
+    total_air_volume_flow_m3_h = np.zeros(n_rows)
+    path_air_volume_flow_m3_h = np.zeros(n_rows)
+
+    total_dry_air_mass_flow_kg_h = np.zeros(n_rows)
+    path_dry_air_mass_flow_kg_h = np.zeros(n_rows)
 
     inlet_w = np.full(n_rows, np.nan)
     outlet_w = np.full(n_rows, np.nan)
@@ -1872,7 +1896,6 @@ def simulate_zonal_coupled_drying_stage15(
     zone_records = []
 
     source_extrapolated_removed_kg = 0.0
-    total_page_predicted_removed_kg = 0.0
     total_capacity_limited_kg = 0.0
 
     for pos in range(n_rows):
@@ -1924,7 +1947,9 @@ def simulate_zonal_coupled_drying_stage15(
             row["humidity_ratio_kg_kg"]
         )
         p_kpa = float(row["PS"])
-        velocity = float(row["air_velocity_m_s"])
+
+        # This is the LOCAL Page velocity from stage 14.
+        velocity_page = float(row["air_velocity_m_s"])
 
         inlet_t[pos] = t_air
         inlet_w[pos] = w_air
@@ -1934,9 +1959,15 @@ def simulate_zonal_coupled_drying_stage15(
             p_kpa,
         )
 
-        volume_flow_m3_s = (
-            velocity
-            * float(effective_flow_area_m2)
+        # ---------------------------------------------------------
+        # Correct v_Page <-> area <-> fan flow linkage
+        # ---------------------------------------------------------
+        volume_flow_path_m3_s = (
+            velocity_page * area_path
+        )
+
+        volume_flow_total_m3_s = (
+            volume_flow_path_m3_s * n_parallel
         )
 
         rho_da_in = float(
@@ -1947,30 +1978,43 @@ def simulate_zonal_coupled_drying_stage15(
             ).iloc[0]
         )
 
-        mdot_da_kg_s = (
-            rho_da_in
-            * volume_flow_m3_s
+        mdot_da_path_kg_s = (
+            rho_da_in * volume_flow_path_m3_s
+        )
+
+        mdot_da_total_kg_s = (
+            mdot_da_path_kg_s * n_parallel
         )
 
         if (
-            not math.isfinite(mdot_da_kg_s)
-            or mdot_da_kg_s <= 0
+            not math.isfinite(mdot_da_path_kg_s)
+            or mdot_da_path_kg_s <= 0
         ):
             raise ValueError(
                 "Не вдалося визначити додатну масову "
-                "витрату сухого повітря."
+                "витрату сухого повітря в одному тракті."
             )
 
-        air_volume_flow_m3_h[pos] = (
-            volume_flow_m3_s * 3600.0
-        )
-        dry_air_mass_flow_kg_h[pos] = (
-            mdot_da_kg_s * 3600.0
+        path_air_volume_flow_m3_h[pos] = (
+            volume_flow_path_m3_s * 3600.0
         )
 
-        removed_this_step = 0.0
+        total_air_volume_flow_m3_h[pos] = (
+            volume_flow_total_m3_s * 3600.0
+        )
 
-        # Air is propagated serially through the zones.
+        path_dry_air_mass_flow_kg_h[pos] = (
+            mdot_da_path_kg_s * 3600.0
+        )
+
+        total_dry_air_mass_flow_kg_h[pos] = (
+            mdot_da_total_kg_s * 3600.0
+        )
+
+        removed_path_this_step = 0.0
+
+        # Air propagates serially through zones of ONE representative
+        # path. Parallel paths are assumed identical.
         for zone_idx in range(int(zone_count)):
             x_old = float(x_zone[zone_idx])
 
@@ -1994,7 +2038,7 @@ def simulate_zonal_coupled_drying_stage15(
                 page_k_scalar_wheat_pionier(
                     zone_in_t,
                     zone_in_rh,
-                    velocity,
+                    velocity_page,
                 )
             )
 
@@ -2025,9 +2069,9 @@ def simulate_zonal_coupled_drying_stage15(
                 and x_old > xeq
             )
 
-            page_removed_kg = 0.0
-            air_capacity_kg = 0.0
-            actual_removed_kg = 0.0
+            page_removed_path_kg = 0.0
+            air_capacity_path_kg = 0.0
+            actual_removed_path_kg = 0.0
             limited_by_air_capacity = False
 
             if model_usable:
@@ -2051,20 +2095,15 @@ def simulate_zonal_coupled_drying_stage15(
                     * math.exp(-exponent_increment)
                 )
 
-                # The target moisture is a process constraint.
                 x_page = max(
                     float(target_x_db),
                     float(x_page),
                 )
 
-                page_removed_kg = max(
+                page_removed_path_kg = max(
                     0.0,
                     dry_mass_zone
                     * (x_old - x_page),
-                )
-
-                total_page_predicted_removed_kg += (
-                    page_removed_kg
                 )
 
                 h_zone_in = (
@@ -2081,38 +2120,37 @@ def simulate_zonal_coupled_drying_stage15(
                 )
 
                 if math.isfinite(w_sat_ad):
-                    air_capacity_kg = max(
+                    air_capacity_path_kg = max(
                         0.0,
-                        mdot_da_kg_s
+                        mdot_da_path_kg_s
                         * dt_s
                         * (w_sat_ad - zone_in_w),
                     )
                 else:
-                    air_capacity_kg = float("inf")
+                    air_capacity_path_kg = float("inf")
 
-                actual_removed_kg = min(
-                    page_removed_kg,
-                    air_capacity_kg,
+                actual_removed_path_kg = min(
+                    page_removed_path_kg,
+                    air_capacity_path_kg,
                 )
 
                 limited_by_air_capacity = (
-                    actual_removed_kg
-                    < page_removed_kg - 1e-12
+                    actual_removed_path_kg
+                    < page_removed_path_kg - 1e-12
                 )
 
                 if limited_by_air_capacity:
-                    capacity_limited_interval[
-                        pos
-                    ] = True
+                    capacity_limited_interval[pos] = True
 
+                    # Convert the lost capacity to total dryer scale.
                     total_capacity_limited_kg += (
-                        page_removed_kg
-                        - actual_removed_kg
-                    )
+                        page_removed_path_kg
+                        - actual_removed_path_kg
+                    ) * n_parallel
 
                 x_new = (
                     x_old
-                    - actual_removed_kg
+                    - actual_removed_path_kg
                     / dry_mass_zone
                 )
 
@@ -2122,6 +2160,7 @@ def simulate_zonal_coupled_drying_stage15(
                 )
 
                 tau_zone_min[zone_idx] += dt_min
+
             else:
                 x_new = x_old
 
@@ -2135,25 +2174,26 @@ def simulate_zonal_coupled_drying_stage15(
 
             if (
                 source_moisture_extrapolation
-                and actual_removed_kg > 0
+                and actual_removed_path_kg > 0
             ):
                 source_extrapolated_removed_kg += (
-                    actual_removed_kg
+                    actual_removed_path_kg
+                    * n_parallel
                 )
 
-            removed_this_step += actual_removed_kg
+            removed_path_this_step += (
+                actual_removed_path_kg
+            )
 
-            # Moisture balance across current zone.
             zone_out_w = (
                 zone_in_w
-                + actual_removed_kg
+                + actual_removed_path_kg
                 / (
-                    mdot_da_kg_s
+                    mdot_da_path_kg_s
                     * dt_s
                 )
             )
 
-            # Adiabatic diagnostic propagation through the zone.
             h_zone_in = (
                 moist_air_enthalpy_scalar_kj_kg_da(
                     zone_in_t,
@@ -2179,13 +2219,23 @@ def simulate_zonal_coupled_drying_stage15(
             zone_records.append(
                 {
                     "time_local": (
-                        result.index[pos]
-                        if result.index.name is not None
-                        else pos
+                        result.iloc[pos]["time_local"]
+                        if "time_local" in result.columns
+                        else result.index[pos]
                     ),
                     "time_position": pos,
                     "zone": zone_idx + 1,
                     "zone_count": int(zone_count),
+                    "parallel_path_count": n_parallel,
+                    "active_flow_area_per_path_m2": area_path,
+                    "total_active_flow_area_m2": area_total,
+                    "page_velocity_m_s": velocity_page,
+                    "fan_flow_path_m3_h": (
+                        volume_flow_path_m3_s * 3600.0
+                    ),
+                    "fan_flow_total_m3_h": (
+                        volume_flow_total_m3_s * 3600.0
+                    ),
                     "x_start_db_kg_kg": x_old,
                     "x_end_db_kg_kg": x_new,
                     "moisture_end_wb_pct": (
@@ -2203,16 +2253,20 @@ def simulate_zonal_coupled_drying_stage15(
                     "source_initial_moisture_extrapolation": (
                         source_moisture_extrapolation
                     ),
-                    "page_predicted_water_removed_kg": (
-                        page_removed_kg
+                    "page_predicted_water_removed_path_kg": (
+                        page_removed_path_kg
                     ),
-                    "air_vapour_capacity_kg": (
-                        air_capacity_kg
-                        if math.isfinite(air_capacity_kg)
+                    "air_vapour_capacity_path_kg": (
+                        air_capacity_path_kg
+                        if math.isfinite(air_capacity_path_kg)
                         else float("nan")
                     ),
-                    "actual_water_removed_kg": (
-                        actual_removed_kg
+                    "actual_water_removed_path_kg": (
+                        actual_removed_path_kg
+                    ),
+                    "actual_water_removed_total_kg": (
+                        actual_removed_path_kg
+                        * n_parallel
                     ),
                     "air_capacity_limited": (
                         limited_by_air_capacity
@@ -2225,16 +2279,19 @@ def simulate_zonal_coupled_drying_stage15(
                 }
             )
 
-            # The outlet of this zone is the inlet of the next zone.
             t_air = zone_out_t
             w_air = zone_out_w
 
+        removed_total_this_step = (
+            removed_path_this_step * n_parallel
+        )
+
         total_removed_interval[pos] = (
-            removed_this_step
+            removed_total_this_step
         )
 
         removal_rate_kg_h[pos] = (
-            removed_this_step / dt_h
+            removed_total_this_step / dt_h
         )
 
         outlet_t[pos] = t_air
@@ -2261,9 +2318,6 @@ def simulate_zonal_coupled_drying_stage15(
             )
         )
 
-    # -------------------------------------------------------------
-    # Main time-series result
-    # -------------------------------------------------------------
     result["zonal_average_x_start_db_kg_kg"] = avg_x_start
     result["zonal_average_x_end_db_kg_kg"] = avg_x_end
 
@@ -2284,18 +2338,24 @@ def simulate_zonal_coupled_drying_stage15(
         all_zones_target
     )
 
-    result["effective_flow_area_m2"] = float(
-        effective_flow_area_m2
+    result["page_reference_flow_area_per_path_m2"] = area_path
+    result["parallel_air_path_count"] = n_parallel
+    result["page_reference_flow_area_total_m2"] = area_total
+
+    result["fan_volume_flow_per_path_m3_h"] = (
+        path_air_volume_flow_m3_h
     )
 
-    result["zone_count"] = int(zone_count)
-
-    result["drying_air_volume_flow_m3_h"] = (
-        air_volume_flow_m3_h
+    result["fan_volume_flow_total_m3_h"] = (
+        total_air_volume_flow_m3_h
     )
 
-    result["dry_air_mass_flow_kg_h"] = (
-        dry_air_mass_flow_kg_h
+    result["dry_air_mass_flow_per_path_kg_h"] = (
+        path_dry_air_mass_flow_kg_h
+    )
+
+    result["dry_air_mass_flow_total_kg_h"] = (
+        total_dry_air_mass_flow_kg_h
     )
 
     result["zonal_air_inlet_temp_c"] = inlet_t
@@ -2350,9 +2410,14 @@ def simulate_zonal_coupled_drying_stage15(
         "actual_water_removal_rate_kg_h",
     ]
 
-    positive_air = result.loc[
-        result["drying_air_volume_flow_m3_h"] > 0,
-        "drying_air_volume_flow_m3_h",
+    positive_air_total = result.loc[
+        result["fan_volume_flow_total_m3_h"] > 0,
+        "fan_volume_flow_total_m3_h",
+    ]
+
+    positive_air_path = result.loc[
+        result["fan_volume_flow_per_path_m3_h"] > 0,
+        "fan_volume_flow_per_path_m3_h",
     ]
 
     target_reached = bool(
@@ -2384,9 +2449,7 @@ def simulate_zonal_coupled_drying_stage15(
             )
 
     summary = {
-        "source_initial_x_db": (
-            source_initial_x_db
-        ),
+        "source_initial_x_db": source_initial_x_db,
         "source_initial_x_uncertainty": (
             source_initial_x_uncertainty
         ),
@@ -2405,10 +2468,12 @@ def simulate_zonal_coupled_drying_stage15(
             * 100.0
         ),
         "initial_moisture_extrapolation": bool(
-            initial_x_db
-            > source_upper_observed_x_db
+            initial_x_db > source_upper_observed_x_db
         ),
         "zone_count": int(zone_count),
+        "parallel_path_count": n_parallel,
+        "active_flow_area_per_path_m2": area_path,
+        "active_flow_area_total_m2": area_total,
         "final_average_x_db": final_avg_x,
         "final_average_wb_pct": final_avg_wb,
         "total_water_removed_kg": total_removed,
@@ -2422,9 +2487,14 @@ def simulate_zonal_coupled_drying_stage15(
             if not positive_rates.empty
             else 0.0
         ),
-        "mean_active_air_volume_flow_m3_h": (
-            float(positive_air.mean())
-            if not positive_air.empty
+        "mean_fan_flow_total_m3_h": (
+            float(positive_air_total.mean())
+            if not positive_air_total.empty
+            else 0.0
+        ),
+        "mean_fan_flow_per_path_m3_h": (
+            float(positive_air_path.mean())
+            if not positive_air_path.empty
             else 0.0
         ),
         "target_reached": target_reached,
@@ -4208,7 +4278,7 @@ with tab_heat_mass:
         pass
 
     air_velocity_stage14 = st.number_input(
-        "Розрахункова швидкість сушильного агента vₐ, м/с",
+        "Локальна швидкість через шар v_Page, м/с",
         min_value=0.15,
         max_value=1.00,
         value=float(default_velocity),
@@ -4218,9 +4288,11 @@ with tab_heat_mass:
     )
 
     st.caption(
-        "Це керований робочий параметр, а не підібраний коефіцієнт "
-        "моделі. На наступному етапі швидкість буде пов'язана з "
-        "витратою сушильного агента та геометрією камери."
+        "Це локальна швидкість сушильного агента, яка входить "
+        "у кореляцію Page. У Ramaj et al. повітря проходило через "
+        "поровий об'єм зерна в циліндричному тримачі з перфорованим "
+        "дном. Тому цю швидкість не слід автоматично множити на "
+        "повний поперечний переріз сушильної камери."
     )
 
     if "equilibrium_moisture_profile" not in st.session_state:
@@ -4453,11 +4525,12 @@ with tab_coupled:
     )
 
     st.info(
-        "Попередня однозонна схема замінена на послідовну зональну "
-        "модель. Повітря проходить через розрахункові зони одну за "
-        "одною; після кожної зони його вологовміст збільшується, "
-        "а температура за адіабатичним наближенням зменшується. "
-        "Тому наступна зона вже не отримує ті самі умови, що й перша."
+        "На цьому етапі локальна швидкість v_Page відділена від "
+        "загальної продуктивності вентилятора. У Ramaj et al. "
+        "швидкість вимірювалася для повітря, що проходило через "
+        "поровий об'єм зерна у тримачі з перфорованим дном. "
+        "Тому V̇вент визначається через активну площу проходу "
+        "безпосередньо через продукт, а не через повний переріз камери."
     )
 
     st.markdown("#### 1. Обмеження вихідної Page-моделі")
@@ -4474,40 +4547,20 @@ with tab_coupled:
     )
 
     st.write(
-        "Ramaj et al. (2021) повідомляють для вихідної пшениці "
-        f"**X₀={source_x0:.3f}±{source_x0_unc:.3f} кг/кг d.b.**, "
-        f"тобто приблизно **{source_w0:.2f} % w.b.** "
-        "Наша базова модель починається з "
+        "Ramaj et al. (2021): "
+        f"**X₀={source_x0:.3f}±{source_x0_unc:.3f} кг/кг d.b.** "
+        f"(≈ **{source_w0:.2f} % w.b.**). "
+        "Наша модель: "
         f"**X₀={model_x0:.3f} кг/кг d.b.** "
         f"({float(product['initial_moisture_pct']):.1f} % w.b.)."
     )
 
     if model_x0 > source_x0 + source_x0_unc:
         st.warning(
-            "Початкова частина нашого процесу лежить вище "
-            "початкового вологовмісту, на якому виконувалися "
-            "експерименти Ramaj et al. Page усе одно обчислюється, "
-            "але такі зони та інтервали маркуються як екстраполяція "
-            "за початковим станом продукту. Коригувальний коефіцієнт "
-            "не вводиться, оскільки для нього немає експериментального "
-            "обґрунтування."
+            "Початкова частина процесу є екстраполяцією Page "
+            "за станом продукту. Вона маркується окремо; "
+            "штучний коригувальний коефіцієнт не вводиться."
         )
-
-    st.markdown("#### 2. Дискретизація камери вздовж потоку")
-
-    zone_count_stage15 = st.number_input(
-        "Кількість розрахункових зон уздовж потоку",
-        min_value=2,
-        max_value=20,
-        value=5,
-        step=1,
-        key="zone_count_stage15",
-    )
-
-    st.caption(
-        "Це чисельна дискретизація, а не кількість лотків. "
-        "Суха речовина продукту рівномірно розподіляється між зонами."
-    )
 
     if "heat_mass_transfer_input_profile" not in st.session_state:
         st.warning(
@@ -4527,35 +4580,202 @@ with tab_coupled:
             "dryer_geometry"
         ]
 
-        gross_flow_area = float(
+        tray_area = float(
+            geometry15["tray_area_m2"]
+        )
+        tray_count_geom = int(
+            geometry15.get("tray_count", 1)
+        )
+        total_drying_area = float(
+            geometry15["total_drying_area_m2"]
+        )
+        chamber_cross_section = float(
             geometry15["gross_flow_area_m2"]
         )
 
-        st.markdown("#### 3. Площа проходу та витрата повітря")
-
-        st.latex(
-            rf"A_{{\mathrm{{пот,геом}}}}="
-            rf"{gross_flow_area:.4f}\ \mathrm{{м^2}}"
+        st.markdown(
+            "#### 2. Схема повітророзподілу через продукт"
         )
 
-        effective_flow_area_m2 = st.number_input(
-            "Ефективна вільна площа проходу сушильного агента, м²",
-            min_value=0.001,
-            max_value=max(0.001, gross_flow_area),
-            value=float(gross_flow_area),
-            step=0.01,
-            format="%.4f",
-            key="effective_flow_area_stage15_m2",
+        airflow_scheme = st.radio(
+            "Оберіть фізичну схему проходження повітря",
+            options=[
+                "Послідовний тракт через лотки",
+                "Паралельний розподіл між лотками",
+                "Користувацька кількість паралельних трактів",
+            ],
+            index=0,
+            key="stage15_airflow_scheme",
+        )
+
+        if airflow_scheme == "Послідовний тракт через лотки":
+            parallel_path_count = 1
+            st.write(
+                "Одне й те саме повітря послідовно проходить "
+                "через зони/шари продукту. Для зв'язку з v_Page "
+                "використовується площа одного активного шару."
+            )
+
+        elif airflow_scheme == "Паралельний розподіл між лотками":
+            parallel_path_count = tray_count_geom
+            st.write(
+                "Загальний потік вентилятора ділиться між "
+                f"**{tray_count_geom}** однаковими паралельними "
+                "трактами. Кожен тракт має ту саму локальну "
+                "швидкість v_Page."
+            )
+
+        else:
+            parallel_path_count = int(
+                st.number_input(
+                    "Кількість однакових паралельних трактів",
+                    min_value=1,
+                    max_value=50,
+                    value=max(1, tray_count_geom),
+                    step=1,
+                    key="stage15_parallel_path_count",
+                )
+            )
+
+        st.markdown(
+            "#### 3. Активна площа одного повітряного тракту"
+        )
+
+        st.write(
+            f"Корисна площа одного лотка за геометрією: "
+            f"**{tray_area:.4f} м²**. "
+            f"Сумарна площа сушіння: **{total_drying_area:.4f} м²**. "
+            f"Повний переріз камери: **{chamber_cross_section:.4f} м²**."
+        )
+
+        area_basis = st.radio(
+            "Як задати площу, перпендикулярну локальному потоку через продукт?",
+            options=[
+                "Площа одного лотка",
+                "Задати вручну",
+            ],
+            index=0,
+            key="stage15_area_basis",
+        )
+
+        if area_basis == "Площа одного лотка":
+            active_area_per_path = tray_area
+        else:
+            active_area_per_path = st.number_input(
+                "Активна площа одного тракту Aшар, м²",
+                min_value=0.001,
+                value=float(tray_area),
+                step=0.01,
+                format="%.4f",
+                key="stage15_active_area_per_path_m2",
+            )
+
+        st.caption(
+            "Це площа поперечного перерізу шару, до якої відноситься "
+            "локальна superficial velocity v_Page. Вона не є сумою "
+            "площ отворів перфорації. Для packed/thin-layer потоку "
+            "superficial velocity відноситься до повної площі "
+            "поперечного перерізу шару."
+        )
+
+        st.markdown(
+            "#### 4. Зв'язок v_Page із продуктивністю вентилятора"
+        )
+
+        page_velocity_series = pd.to_numeric(
+            stage15_input["air_velocity_m_s"],
+            errors="coerce",
+        )
+
+        v_page_design = float(
+            page_velocity_series.dropna().iloc[0]
+            if not page_velocity_series.dropna().empty
+            else 0.50
+        )
+
+        flow_one_path_m3_h = (
+            v_page_design
+            * float(active_area_per_path)
+            * 3600.0
+        )
+
+        flow_total_m3_h = (
+            flow_one_path_m3_h
+            * int(parallel_path_count)
+        )
+
+        old_wrong_mapping_m3_h = (
+            v_page_design
+            * chamber_cross_section
+            * 3600.0
         )
 
         st.latex(
-            r"\dot V_a=v_aA_{\mathrm{еф}}"
+            r"\dot V_{\mathrm{тракт}}"
+            r"=v_{\mathrm{Page}}A_{\mathrm{шар}}"
+        )
+
+        st.latex(
+            r"\dot V_{\mathrm{вент}}"
+            r"=N_{\parallel}\dot V_{\mathrm{тракт}}"
+        )
+
+        f1, f2, f3, f4 = st.columns(4)
+
+        f1.metric(
+            "v_Page",
+            f"{v_page_design:.2f} м/с",
+        )
+
+        f2.metric(
+            "A шару одного тракту",
+            f"{float(active_area_per_path):.3f} м²",
+        )
+
+        f3.metric(
+            "Витрата одного тракту",
+            f"{flow_one_path_m3_h:.0f} м³/год",
+        )
+
+        f4.metric(
+            "Загальна витрата вентилятора",
+            f"{flow_total_m3_h:.0f} м³/год",
+        )
+
+        st.write(
+            "Для порівняння, стара схема автоматично множила "
+            f"v_Page на повний переріз камери і давала "
+            f"**{old_wrong_mapping_m3_h:.0f} м³/год**. "
+            "Це значення більше не використовується у розрахунку."
+        )
+
+        if (
+            airflow_scheme
+            == "Паралельний розподіл між лотками"
+        ):
+            st.info(
+                "У паралельній схемі зональна модель розраховує "
+                "один репрезентативний тракт із 1/N частиною "
+                "продукту, а потім масштабує видалену воду та "
+                "витрату повітря на всі однакові тракти."
+            )
+
+        st.markdown(
+            "#### 5. Дискретизація репрезентативного тракту"
+        )
+
+        zone_count_stage15 = st.number_input(
+            "Кількість розрахункових зон уздовж одного тракту",
+            min_value=2,
+            max_value=20,
+            value=5,
+            step=1,
+            key="zone_count_stage15",
         )
 
         st.caption(
-            "Поточне значення Aеф залишається конструктивним "
-            "вхідним параметром. Якщо лотки або напрямні перекривають "
-            "частину перерізу, слід ввести реальну вільну площу."
+            "Це чисельна дискретизація вздовж потоку, а не "
+            "кількість лотків."
         )
 
         current_balance15 = calculate_mass_balance(
@@ -4581,8 +4801,11 @@ with tab_coupled:
                     current_balance15["final_dry_basis"]
                 ),
                 step_minutes=int(model_step_minutes),
-                effective_flow_area_m2=float(
-                    effective_flow_area_m2
+                active_flow_area_per_path_m2=float(
+                    active_area_per_path
+                ),
+                parallel_path_count=int(
+                    parallel_path_count
                 ),
                 zone_count=int(zone_count_stage15),
             )
@@ -4601,9 +4824,9 @@ with tab_coupled:
                 "coupled_drying_summary"
             ] = coupled_summary
 
-            m1, m2, m3, m4 = st.columns(4)
+            r1, r2, r3, r4 = st.columns(4)
 
-            m1.metric(
+            r1.metric(
                 "Кінцева середня вологість",
                 (
                     f"{coupled_summary['final_average_wb_pct']:.2f} "
@@ -4611,7 +4834,7 @@ with tab_coupled:
                 ),
             )
 
-            m2.metric(
+            r2.metric(
                 "Видалено води",
                 (
                     f"{coupled_summary['total_water_removed_kg']:.3f} "
@@ -4619,7 +4842,7 @@ with tab_coupled:
                 ),
             )
 
-            m3.metric(
+            r3.metric(
                 "Середня фактична швидкість",
                 (
                     f"{coupled_summary['mean_actual_removal_rate_kg_h']:.4f} "
@@ -4627,11 +4850,34 @@ with tab_coupled:
                 ),
             )
 
-            m4.metric(
-                "Середня активна витрата повітря",
+            r4.metric(
+                "Середня активна V̇вент",
                 (
-                    f"{coupled_summary['mean_active_air_volume_flow_m3_h']:.1f} "
+                    f"{coupled_summary['mean_fan_flow_total_m3_h']:.0f} "
                     "м³/год"
+                ),
+            )
+
+            p1, p2, p3 = st.columns(3)
+
+            p1.metric(
+                "Паралельних трактів",
+                str(coupled_summary["parallel_path_count"]),
+            )
+
+            p2.metric(
+                "Витрата одного тракту",
+                (
+                    f"{coupled_summary['mean_fan_flow_per_path_m3_h']:.0f} "
+                    "м³/год"
+                ),
+            )
+
+            p3.metric(
+                "Сумарна активна площа",
+                (
+                    f"{coupled_summary['active_flow_area_total_m2']:.3f} "
+                    "м²"
                 ),
             )
 
@@ -4639,7 +4885,7 @@ with tab_coupled:
                 st.success(
                     "Усі розрахункові зони досягли заданої "
                     "кінцевої вологості. Після цього активний "
-                    "повітряний потік автоматично вимикається."
+                    "потік сушіння автоматично вимикається."
                 )
 
                 if coupled_summary["target_time"]:
@@ -4650,17 +4896,17 @@ with tab_coupled:
             else:
                 st.warning(
                     "За заданої тривалості не всі зони досягли "
-                    "кінцевої вологості 13 % w.b."
+                    "кінцевої вологості."
                 )
 
             st.markdown(
-                "#### 4. Контроль екстраполяції за початковою вологістю"
+                "#### 6. Контроль екстраполяції за X₀"
             )
 
             e1, e2 = st.columns(2)
 
             e1.metric(
-                "Вода, видалена в зоні екстраполяції X₀",
+                "Вода в зоні екстраполяції X₀",
                 (
                     f"{coupled_summary['source_extrapolated_removed_kg']:.3f} "
                     "кг"
@@ -4675,26 +4921,8 @@ with tab_coupled:
                 ),
             )
 
-            st.caption(
-                "Під «екстраполяцією X₀» маються на увазі ті "
-                "розрахункові стани, де X > 0,160 кг/кг d.b. "
-                "(0,159+0,001 з вихідного експерименту Ramaj et al.). "
-                "Це не означає, що Page автоматично неправильна, "
-                "але ця частина прогнозу не підтверджена початковим "
-                "вологовмістом вихідного експерименту."
-            )
-
             st.markdown(
-                "#### 5. Обмеження пропускною здатністю повітря"
-            )
-
-            st.latex(
-                r"\Delta m_{\mathrm{в,факт}}"
-                r"=\min\left("
-                r"\Delta m_{\mathrm{в,Page}},"
-                r"\dot m_{da}\Delta t"
-                r"(d_{\mathrm{sat,ad}}-d_{\mathrm{in}})"
-                r"\right)"
+                "#### 7. Обмеження здатністю повітря переносити вологу"
             )
 
             a1, a2 = st.columns(2)
@@ -4709,17 +4937,11 @@ with tab_coupled:
             )
 
             a2.metric(
-                "Скорочення видалення води через межу насичення",
+                "Зменшення видалення води",
                 (
                     f"{coupled_summary['air_capacity_limited_water_difference_kg']:.3f} "
                     "кг"
                 ),
-            )
-
-            st.write(
-                "Тепер Page не може вимагати від повітря перенести "
-                "більше води, ніж воно фізично здатне втримати у "
-                "паровій фазі до адіабатичного насичення."
             )
 
             if (
@@ -4728,21 +4950,18 @@ with tab_coupled:
                 ] > 0
             ):
                 st.warning(
-                    "Також залишаються інтервали з екстраполяцією "
-                    "Page за RH поза 20–60 %. Вони продовжують "
-                    "маркуватися окремо."
+                    "Є інтервали з екстраполяцією Page за RH "
+                    "поза 20–60 %. Вони маркуються окремо."
                 )
 
             if coupled_summary["unusable_intervals"] > 0:
                 st.error(
-                    "Є інтервали, у яких хоча б одна зона вийшла "
-                    "за область Modified Oswin або за допустимі "
-                    "T/v узагальненої Page. Для такої зони сушіння "
-                    "в цьому інтервалі не обчислюється."
+                    "Є інтервали, де хоча б одна зона виходить "
+                    "за допустимі T/v Page або область Modified Oswin."
                 )
 
             st.markdown(
-                "#### 6. Порівняння з цільовою траєкторією"
+                "#### 8. Порівняння фактичної та цільової вологості"
             )
 
             comparison_df = pd.DataFrame(
@@ -4763,10 +4982,7 @@ with tab_coupled:
                     "required_moisture_removal_profile"
                 ]
 
-                if (
-                    len(target_profile15)
-                    == len(comparison_df)
-                ):
+                if len(target_profile15) == len(comparison_df):
                     comparison_df[
                         "Цільова траєкторія, % w.b."
                     ] = target_profile15[
@@ -4779,7 +4995,7 @@ with tab_coupled:
             )
 
             st.markdown(
-                "#### 7. Фактична швидкість видалення води"
+                "#### 9. Фактична швидкість видалення води"
             )
 
             st.line_chart(
@@ -4790,24 +5006,18 @@ with tab_coupled:
             )
 
             st.markdown(
-                "#### 8. Витрата сушильного агента"
+                "#### 10. Загальна продуктивність вентилятора"
             )
 
             st.line_chart(
                 coupled_profile[
-                    ["drying_air_volume_flow_m3_h"]
+                    ["fan_volume_flow_total_m3_h"]
                 ],
                 use_container_width=True,
             )
 
-            st.write(
-                "Після досягнення кінцевої вологості всіма зонами "
-                "витрата активного сушіння автоматично стає нульовою. "
-                "Нічний захисний режим буде сформований окремо."
-            )
-
             st.markdown(
-                "#### 9. Зміна стану повітря вздовж камери"
+                "#### 11. Зміна стану повітря вздовж тракту"
             )
 
             air_chart = pd.DataFrame(
@@ -4832,7 +5042,7 @@ with tab_coupled:
             )
 
             st.markdown(
-                "#### 10. Деталізація по розрахункових зонах"
+                "#### 12. Деталізація по зонах"
             )
 
             if not coupled_zone_profile.empty:
@@ -4841,24 +5051,17 @@ with tab_coupled:
                     use_container_width=True,
                 )
 
-                st.write(
-                    "У цій таблиці видно, що кожна наступна зона "
-                    "отримує вже змінені T, RH і d після попередньої "
-                    "зони. Саме цього не було в попередній "
-                    "однозонній версії."
-                )
-
             st.download_button(
                 "Завантажити часовий ряд зональної моделі",
                 data=dataframe_to_csv_bytes(
                     coupled_profile
                 ),
                 file_name=(
-                    "zonal_coupled_drying_stage15.csv"
+                    "zonal_coupled_drying_airflow_linked.csv"
                 ),
                 mime="text/csv",
                 use_container_width=True,
-                key="download_zonal_coupled_stage15",
+                key="download_zonal_coupled_stage15_v12",
             )
 
             if not coupled_zone_profile.empty:
@@ -4868,25 +5071,25 @@ with tab_coupled:
                         coupled_zone_profile
                     ),
                     file_name=(
-                        "zonal_coupled_drying_details.csv"
+                        "zonal_coupled_drying_airflow_linked_details.csv"
                     ),
                     mime="text/csv",
                     use_container_width=True,
-                    key="download_zonal_details_stage15",
+                    key="download_zonal_details_stage15_v12",
                 )
 
             st.warning(
-                "Навіть після цих уточнень результат вище X₀≈0,159 "
-                "кг/кг d.b. залишається екстраполяцією Page, а "
-                "адіабатичне охолодження ще не враховує нагрівання "
-                "самого зерна, конструкцій і теплові втрати. "
-                "Ці складові будуть введені на теплових етапах."
+                "Схема повітророзподілу є конструктивним вибором. "
+                "Якщо реальна сушарка має горизонтальний обдув над "
+                "лотками, а не проходження повітря крізь шар зерна, "
+                "пряме перенесення v_Page із Ramaj потребуватиме "
+                "окремого обґрунтування або експериментальної "
+                "валідації."
             )
 
             st.info(
-                "Наступний етап — пункт 16: кількісно порівняти "
-                "фактичний зональний режим із потрібною швидкістю "
-                "видалення води та оцінити запас/дефіцит "
-                "продуктивності сушарки."
+                "Після вибору реальної схеми повітророзподілу "
+                "можна переходити до пункту 16 — перевірки "
+                "запасу/дефіциту продуктивності сушіння."
             )
 
