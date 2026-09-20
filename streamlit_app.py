@@ -2835,6 +2835,336 @@ def evaluate_drying_performance_stage16(
 
     return result, summary
 
+
+def calculate_air_heating_demand_stage17(
+    coupled_profile: pd.DataFrame,
+    step_minutes: int,
+) -> tuple[pd.DataFrame, dict[str, float | int]]:
+    """
+    Пункт 17. Теплота на нагрівання сушильного агента.
+
+    Розраховується теплова потужність, необхідна лише для
+    чутливого нагрівання зовнішнього вологого повітря до заданої
+    температури сушіння перед входом у сушильну камеру.
+
+    Перед нагріванням і після нього вологовміст d вважається
+    незмінним:
+
+        d_heat,out = d_amb
+
+    Ентальпія вологого повітря:
+        h = 1.006*T + d*(2501 + 1.86*T)
+        [кДж/кг сухого повітря]
+
+    Потрібна теплова потужність:
+        Qdot_air = mdot_da * (h_dry - h_amb)
+
+    де mdot_da береться у кг сухого повітря/с.
+    Результат Qdot_air отримується у кВт.
+
+    Важливо:
+    це лише теплота на нагрівання сушильного агента.
+    Тут ще НЕ враховані:
+    - теплота випаровування вологи;
+    - нагрівання продукту;
+    - нагрівання конструкцій;
+    - теплові втрати;
+    - рекуперація.
+
+    Температура сушіння поки є заданою цільовою температурою.
+    Реальна можливість забезпечити її сонячним колектором,
+    акумулятором та ТЕН буде перевірятися на наступних етапах.
+    """
+    import numpy as np
+
+    required = {
+        "T2M",
+        "humidity_ratio_kg_kg",
+        "drying_air_temperature_c",
+        "dry_air_mass_flow_total_kg_h",
+        "active_drying_command",
+    }
+
+    missing = required - set(coupled_profile.columns)
+    if missing:
+        raise ValueError(
+            "Для етапу 17 відсутні параметри: "
+            + ", ".join(sorted(missing))
+        )
+
+    if step_minutes <= 0:
+        raise ValueError(
+            "Крок моделювання має бути більшим за нуль."
+        )
+
+    result = coupled_profile.copy()
+
+    t_amb = pd.to_numeric(
+        result["T2M"],
+        errors="coerce",
+    )
+
+    d = pd.to_numeric(
+        result["humidity_ratio_kg_kg"],
+        errors="coerce",
+    )
+
+    t_dry = pd.to_numeric(
+        result["drying_air_temperature_c"],
+        errors="coerce",
+    )
+
+    mdot_da_kg_h = pd.to_numeric(
+        result["dry_air_mass_flow_total_kg_h"],
+        errors="coerce",
+    ).fillna(0.0)
+
+    active = (
+        result["active_drying_command"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    # Enthalpy before and after sensible heating.
+    h_amb = moist_air_enthalpy_kj_kg_da(
+        temperature_c=t_amb,
+        humidity_ratio_kg_kg=d,
+    )
+    h_amb.index = result.index
+
+    h_dry = moist_air_enthalpy_kj_kg_da(
+        temperature_c=t_dry,
+        humidity_ratio_kg_kg=d,
+    )
+    h_dry.index = result.index
+
+    delta_h = h_dry - h_amb
+
+    # Equivalent humid-air specific heat per kg dry air.
+    cp_moist_air = 1.006 + 1.86 * d
+
+    delta_t = t_dry - t_amb
+
+    mdot_da_kg_s = mdot_da_kg_h / 3600.0
+
+    # Signed thermal power. Positive => heating required.
+    qdot_signed_kw = (
+        mdot_da_kg_s * delta_h
+    )
+
+    # Only active drying intervals require this heating in the
+    # current stage. Negative values (ambient hotter than target)
+    # are not counted as heating demand.
+    qdot_heating_kw = qdot_signed_kw.where(
+        active,
+        0.0,
+    )
+
+    qdot_heating_kw = qdot_heating_kw.clip(
+        lower=0.0
+    )
+
+    qdot_cooling_equivalent_kw = (
+        (-qdot_signed_kw)
+        .where(active, 0.0)
+        .clip(lower=0.0)
+    )
+
+    dt_h = float(step_minutes) / 60.0
+
+    heat_energy_kwh_interval = (
+        qdot_heating_kw * dt_h
+    )
+
+    cumulative_heat_energy_kwh = (
+        heat_energy_kwh_interval.cumsum()
+    )
+
+    # Diagnostic cross-check using cp*DeltaT.
+    qdot_cp_check_kw = (
+        mdot_da_kg_s
+        * cp_moist_air
+        * delta_t
+    ).where(
+        active,
+        0.0,
+    )
+
+    qdot_cp_check_kw = qdot_cp_check_kw.clip(
+        lower=0.0
+    )
+
+    check_difference_kw = (
+        qdot_heating_kw
+        - qdot_cp_check_kw
+    )
+
+    result["air_heating_ambient_temp_c"] = t_amb
+    result["air_heating_target_temp_c"] = t_dry
+    result["air_heating_delta_t_c"] = delta_t
+
+    result["air_heating_humidity_ratio_kg_kg"] = d
+
+    result["air_heating_cp_kj_kg_da_k"] = (
+        cp_moist_air
+    )
+
+    result["air_heating_h_ambient_kj_kg_da"] = (
+        h_amb
+    )
+
+    result["air_heating_h_target_kj_kg_da"] = (
+        h_dry
+    )
+
+    result["air_heating_delta_h_kj_kg_da"] = (
+        delta_h
+    )
+
+    result["air_heating_dry_air_mass_flow_kg_h"] = (
+        mdot_da_kg_h
+    )
+
+    result["air_heating_power_kw"] = (
+        qdot_heating_kw
+    )
+
+    result["air_cooling_equivalent_power_kw"] = (
+        qdot_cooling_equivalent_kw
+    )
+
+    result["air_heating_energy_kwh_interval"] = (
+        heat_energy_kwh_interval
+    )
+
+    result["air_heating_energy_kwh_cumulative"] = (
+        cumulative_heat_energy_kwh
+    )
+
+    result["air_heating_cp_check_kw"] = (
+        qdot_cp_check_kw
+    )
+
+    result["air_heating_balance_check_kw"] = (
+        check_difference_kw
+    )
+
+    active_heating = result.loc[
+        result["air_heating_power_kw"] > 0
+    ]
+
+    total_heat_kwh = float(
+        result["air_heating_energy_kwh_interval"].sum()
+    )
+
+    peak_heat_kw = (
+        float(
+            active_heating[
+                "air_heating_power_kw"
+            ].max()
+        )
+        if not active_heating.empty
+        else 0.0
+    )
+
+    mean_heat_kw = (
+        float(
+            active_heating[
+                "air_heating_power_kw"
+            ].mean()
+        )
+        if not active_heating.empty
+        else 0.0
+    )
+
+    mean_delta_t = (
+        float(
+            active_heating[
+                "air_heating_delta_t_c"
+            ].mean()
+        )
+        if not active_heating.empty
+        else 0.0
+    )
+
+    mean_delta_h = (
+        float(
+            active_heating[
+                "air_heating_delta_h_kj_kg_da"
+            ].mean()
+        )
+        if not active_heating.empty
+        else 0.0
+    )
+
+    active_heating_hours = (
+        int((result["air_heating_power_kw"] > 0).sum())
+        * dt_h
+    )
+
+    cooling_intervals = int(
+        (
+            result["air_cooling_equivalent_power_kw"]
+            > 0
+        ).sum()
+    )
+
+    max_balance_error_kw = float(
+        result["air_heating_balance_check_kw"]
+        .abs()
+        .max()
+    )
+
+    specific_heat_per_removed_water = float("nan")
+
+    if (
+        "actual_water_removed_interval_kg"
+        in result.columns
+    ):
+        removed_water = float(
+            pd.to_numeric(
+                result["actual_water_removed_interval_kg"],
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .sum()
+        )
+
+        if removed_water > 0:
+            specific_heat_per_removed_water = (
+                total_heat_kwh / removed_water
+            )
+
+    summary = {
+        "total_air_heating_energy_kwh": (
+            total_heat_kwh
+        ),
+        "peak_air_heating_power_kw": (
+            peak_heat_kw
+        ),
+        "mean_air_heating_power_kw": (
+            mean_heat_kw
+        ),
+        "active_air_heating_hours": (
+            float(active_heating_hours)
+        ),
+        "mean_air_heating_delta_t_c": (
+            mean_delta_t
+        ),
+        "mean_air_heating_delta_h_kj_kg_da": (
+            mean_delta_h
+        ),
+        "cooling_intervals": cooling_intervals,
+        "max_enthalpy_cp_check_error_kw": (
+            max_balance_error_kw
+        ),
+        "specific_air_heating_kwh_per_kg_removed_water": (
+            specific_heat_per_removed_water
+        ),
+    }
+
+    return result, summary
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -2850,7 +3180,7 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–16: вихідні дані, масовий баланс, режими, "
+    "Етапи 1–17: вихідні дані, масовий баланс, режими, "
     "погодні дані, психрометрія, геометрія, кінетика Page, "
     "рівноважна вологість та формування системи "
     "тепло- і масообміну сушильної камери."
@@ -2863,7 +3193,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -2876,6 +3206,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "9. Тепло- і масообмін",
         "10. Спільний розрахунок сушіння",
         "11. Перевірка продуктивності",
+        "12. Нагрівання сушильного агента",
     ]
 )
 
@@ -5736,10 +6067,316 @@ with tab_performance:
                 key="download_stage16_performance",
             )
 
+# ---------------------------------------------------------------------
+# 12. НАГРІВАННЯ СУШИЛЬНОГО АГЕНТА
+# ---------------------------------------------------------------------
+with tab_air_heating:
+    st.subheader(
+        "Етап 17. Розрахунок теплоти на нагрівання "
+        "сушильного агента"
+    )
+
+    st.info(
+        "На цьому етапі визначається лише теплова потужність, "
+        "потрібна для нагрівання зовнішнього вологого повітря "
+        "до заданої температури сушіння перед входом у камеру. "
+        "Теплота випаровування, нагрівання продукту, конструкцій, "
+        "теплові втрати та рекуперація будуть додані окремо."
+    )
+
+    st.markdown("#### Психрометрична постановка")
+
+    st.write(
+        "При чутливому нагріванні сушильного агента перед камерою "
+        "вологовміст не змінюється:"
+    )
+
+    st.latex(
+        r"d_{\mathrm{нагр,вих}}"
+        r"=d_{\mathrm{зовн}}"
+    )
+
+    st.write(
+        "Ентальпія вологого повітря на 1 кг сухого повітря:"
+    )
+
+    st.latex(
+        r"h=1.006T+d(2501+1.86T)"
+    )
+
+    st.write(
+        "Потрібна теплова потужність для нагрівання:"
+    )
+
+    st.latex(
+        r"\dot Q_{\mathrm{пов}}"
+        r"=\dot m_{da}"
+        r"\left("
+        r"h_{\mathrm{суш}}-h_{\mathrm{зовн}}"
+        r"\right)"
+    )
+
+    st.write(
+        "Оскільки d до і після нагрівання однаковий, це рівнозначно:"
+    )
+
+    st.latex(
+        r"\dot Q_{\mathrm{пов}}"
+        r"=\dot m_{da}"
+        r"(1.006+1.86d)"
+        r"(T_{\mathrm{суш}}-T_{\mathrm{зовн}})"
+    )
+
+    st.caption(
+        "h — кДж/кг сухого повітря; ṁda — кг сухого повітря/с; "
+        "тому Q̇пов отримується у кВт."
+    )
+
+    st.warning(
+        "Tсуш у поточній моделі ще є цільовою заданою температурою "
+        "(для базової пшениці 40 °C), а не температурою, вже "
+        "забезпеченою сонячним колектором. Тут ми визначаємо "
+        "теплову ПОТРЕБУ. На подальших етапах вона буде порівняна "
+        "з реально доступною тепловою генерацією."
+    )
+
+    if "coupled_drying_profile" not in st.session_state:
+        st.warning(
+            "Спочатку виконайте етап 15 у вкладці "
+            "«Спільний розрахунок сушіння»."
+        )
+
+    else:
+        stage17_input = st.session_state[
+            "coupled_drying_profile"
+        ]
+
+        try:
+            (
+                air_heating_profile,
+                air_heating_summary,
+            ) = calculate_air_heating_demand_stage17(
+                coupled_profile=stage17_input,
+                step_minutes=int(model_step_minutes),
+            )
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.session_state[
+                "air_heating_profile"
+            ] = air_heating_profile
+
+            st.session_state[
+                "air_heating_summary"
+            ] = air_heating_summary
+
+            q1, q2, q3, q4 = st.columns(4)
+
+            q1.metric(
+                "Пікова теплова потужність",
+                (
+                    f"{air_heating_summary['peak_air_heating_power_kw']:.2f} "
+                    "кВт"
+                ),
+            )
+
+            q2.metric(
+                "Середня теплова потужність",
+                (
+                    f"{air_heating_summary['mean_air_heating_power_kw']:.2f} "
+                    "кВт"
+                ),
+            )
+
+            q3.metric(
+                "Теплота на нагрівання повітря",
+                (
+                    f"{air_heating_summary['total_air_heating_energy_kwh']:.2f} "
+                    "кВт·год"
+                ),
+            )
+
+            q4.metric(
+                "Тривалість активного нагрівання",
+                (
+                    f"{air_heating_summary['active_air_heating_hours']:.2f} "
+                    "год"
+                ),
+            )
+
+            s1, s2, s3 = st.columns(3)
+
+            s1.metric(
+                "Середній ΔT",
+                (
+                    f"{air_heating_summary['mean_air_heating_delta_t_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            s2.metric(
+                "Середній Δh",
+                (
+                    f"{air_heating_summary['mean_air_heating_delta_h_kj_kg_da']:.2f} "
+                    "кДж/кг с.п."
+                ),
+            )
+
+            specific_q = air_heating_summary[
+                "specific_air_heating_kwh_per_kg_removed_water"
+            ]
+
+            s3.metric(
+                "На 1 кг видаленої води",
+                (
+                    f"{specific_q:.2f} кВт·год/кг"
+                    if pd.notna(specific_q)
+                    else "—"
+                ),
+            )
+
+            if air_heating_summary[
+                "cooling_intervals"
+            ] > 0:
+                st.warning(
+                    "Є активні інтервали, де температура "
+                    "зовнішнього повітря перевищує задану "
+                    "температуру сушіння. Для них потреба в "
+                    "нагріванні прийнята рівною нулю; окремий "
+                    "розрахунок охолодження в цій роботі не "
+                    "виконується."
+                )
+
+            if (
+                air_heating_summary[
+                    "max_enthalpy_cp_check_error_kw"
+                ]
+                > 1e-8
+            ):
+                st.warning(
+                    "Виявлено розбіжність між ентальпійною "
+                    "формою та перевіркою cp·ΔT. Перевірте "
+                    "психрометричні дані."
+                )
+            else:
+                st.success(
+                    "Ентальпійний розрахунок і еквівалентна "
+                    "форма через cp·ΔT узгоджуються."
+                )
+
+            st.markdown(
+                "#### Температура зовнішнього і сушильного повітря"
+            )
+
+            temperature_chart = (
+                air_heating_profile[
+                    [
+                        "air_heating_ambient_temp_c",
+                        "air_heating_target_temp_c",
+                    ]
+                ]
+                .rename(
+                    columns={
+                        "air_heating_ambient_temp_c": (
+                            "T зовнішнього повітря, °C"
+                        ),
+                        "air_heating_target_temp_c": (
+                            "T сушіння (цільова), °C"
+                        ),
+                    }
+                )
+            )
+
+            st.line_chart(
+                temperature_chart,
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Потрібна теплова потужність нагрівання повітря"
+            )
+
+            st.line_chart(
+                air_heating_profile[
+                    ["air_heating_power_kw"]
+                ].rename(
+                    columns={
+                        "air_heating_power_kw": (
+                            "Q̇пов, кВт"
+                        )
+                    }
+                ),
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Накопичена теплота на нагрівання повітря"
+            )
+
+            st.line_chart(
+                air_heating_profile[
+                    ["air_heating_energy_kwh_cumulative"]
+                ].rename(
+                    columns={
+                        "air_heating_energy_kwh_cumulative": (
+                            "Qпов,Σ, кВт·год"
+                        )
+                    }
+                ),
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Часовий ряд розрахунку"
+            )
+
+            stage17_columns = [
+                "operating_mode",
+                "air_heating_ambient_temp_c",
+                "air_heating_target_temp_c",
+                "air_heating_delta_t_c",
+                "air_heating_humidity_ratio_kg_kg",
+                "air_heating_cp_kj_kg_da_k",
+                "air_heating_h_ambient_kj_kg_da",
+                "air_heating_h_target_kj_kg_da",
+                "air_heating_delta_h_kj_kg_da",
+                "air_heating_dry_air_mass_flow_kg_h",
+                "air_heating_power_kw",
+                "air_heating_energy_kwh_interval",
+                "air_heating_energy_kwh_cumulative",
+                "active_drying_command",
+            ]
+
+            existing_stage17_columns = [
+                col
+                for col in stage17_columns
+                if col in air_heating_profile.columns
+            ]
+
+            st.dataframe(
+                air_heating_profile[
+                    existing_stage17_columns
+                ],
+                use_container_width=True,
+            )
+
+            st.download_button(
+                "Завантажити розрахунок нагрівання сушильного агента",
+                data=dataframe_to_csv_bytes(
+                    air_heating_profile
+                ),
+                file_name=(
+                    "stage17_air_heating_demand.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_stage17_air_heating",
+            )
+
             st.info(
-                "Наступний етап — пункт 17: розрахунок теплоти "
-                "на нагрівання сушильного агента. На цьому етапі "
-                "почнеться формування власне теплової потреби "
-                "установки."
+                "Наступний етап — пункт 18: розрахунок теплоти "
+                "на випаровування вологи. Після цього теплову "
+                "потребу на нагрівання повітря та випаровування "
+                "можна буде аналізувати спільно."
             )
 
