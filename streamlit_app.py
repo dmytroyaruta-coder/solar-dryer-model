@@ -2438,15 +2438,31 @@ def simulate_zonal_coupled_drying_stage15(
         )
 
         if "time_local" in result.columns:
-            target_time = str(
-                result.iloc[first_target_pos][
-                    "time_local"
-                ]
-            )
+            try:
+                target_time_start = pd.to_datetime(
+                    result.iloc[first_target_pos]["time_local"]
+                )
+                target_time = str(
+                    target_time_start
+                    + pd.Timedelta(minutes=int(step_minutes))
+                )
+            except Exception:
+                target_time = str(
+                    result.iloc[first_target_pos]["time_local"]
+                )
         else:
-            target_time = str(
-                result.index[first_target_pos]
-            )
+            try:
+                target_time_start = pd.to_datetime(
+                    result.index[first_target_pos]
+                )
+                target_time = str(
+                    target_time_start
+                    + pd.Timedelta(minutes=int(step_minutes))
+                )
+            except Exception:
+                target_time = str(
+                    result.index[first_target_pos]
+                )
 
     summary = {
         "source_initial_x_db": source_initial_x_db,
@@ -2525,6 +2541,300 @@ def simulate_zonal_coupled_drying_stage15(
 
     return result, zone_df, summary
 
+
+def evaluate_drying_performance_stage16(
+    coupled_profile: pd.DataFrame,
+    target_profile: pd.DataFrame,
+    water_to_remove_kg: float,
+    step_minutes: int,
+) -> tuple[pd.DataFrame, dict[str, float | int | bool | str | None]]:
+    """
+    Пункт 16. Перевірка забезпечення потрібної швидкості
+    видалення води.
+
+    Порівнюються:
+    - фактична зональна кінетика з етапу 15;
+    - цільова траєкторія з етапу 10.
+
+    Важливо:
+    миттєва швидкість після дострокового досягнення кінцевої
+    вологості не трактується як "дефіцит", оскільки після виконання
+    технологічної цілі активне сушіння вже не потрібне.
+
+    Основним критерієм є накопичувальне виконання графіка:
+        ΔmΣ(t) = mфакт,Σ(t) - mціль,Σ(t)
+
+    Якщо ΔmΣ < 0 до моменту досягнення цілі, модель відстає від
+    цільового графіка.
+    """
+    import numpy as np
+
+    required_actual = {
+        "actual_water_removed_interval_kg",
+        "actual_water_removal_rate_kg_h",
+        "zonal_average_moisture_end_wb_pct",
+        "all_zones_target_reached",
+    }
+
+    required_target = {
+        "target_water_removed_interval_kg",
+        "required_moisture_removal_rate_kg_h",
+        "target_cumulative_water_removed_kg",
+        "target_product_moisture_wb_pct",
+        "operating_mode",
+    }
+
+    missing_actual = required_actual - set(coupled_profile.columns)
+    missing_target = required_target - set(target_profile.columns)
+
+    if missing_actual:
+        raise ValueError(
+            "В етапі 15 відсутні колонки: "
+            + ", ".join(sorted(missing_actual))
+        )
+
+    if missing_target:
+        raise ValueError(
+            "У цільовому профілі етапу 10 відсутні колонки: "
+            + ", ".join(sorted(missing_target))
+        )
+
+    if len(coupled_profile) != len(target_profile):
+        raise ValueError(
+            "Фактичний і цільовий часові ряди мають різну "
+            "кількість інтервалів."
+        )
+
+    if water_to_remove_kg <= 0:
+        raise ValueError(
+            "Маса води до видалення повинна бути більшою за нуль."
+        )
+
+    dt_h = float(step_minutes) / 60.0
+    tolerance_kg = max(1e-9, water_to_remove_kg * 1e-6)
+
+    result = pd.DataFrame(index=coupled_profile.index)
+
+    if "time_local" in coupled_profile.columns:
+        result["time_local"] = coupled_profile["time_local"].to_numpy()
+
+    result["operating_mode"] = (
+        target_profile["operating_mode"].to_numpy()
+    )
+
+    result["required_rate_kg_h"] = pd.to_numeric(
+        target_profile["required_moisture_removal_rate_kg_h"],
+        errors="coerce",
+    ).fillna(0.0).to_numpy()
+
+    result["actual_rate_kg_h"] = pd.to_numeric(
+        coupled_profile["actual_water_removal_rate_kg_h"],
+        errors="coerce",
+    ).fillna(0.0).to_numpy()
+
+    result["rate_difference_kg_h"] = (
+        result["actual_rate_kg_h"]
+        - result["required_rate_kg_h"]
+    )
+
+    result["target_removed_interval_kg"] = pd.to_numeric(
+        target_profile["target_water_removed_interval_kg"],
+        errors="coerce",
+    ).fillna(0.0).to_numpy()
+
+    result["actual_removed_interval_kg"] = pd.to_numeric(
+        coupled_profile["actual_water_removed_interval_kg"],
+        errors="coerce",
+    ).fillna(0.0).to_numpy()
+
+    result["target_cumulative_removed_kg"] = pd.to_numeric(
+        target_profile["target_cumulative_water_removed_kg"],
+        errors="coerce",
+    ).fillna(0.0).to_numpy()
+
+    result["actual_cumulative_removed_kg"] = (
+        result["actual_removed_interval_kg"]
+        .cumsum()
+        .clip(upper=water_to_remove_kg)
+    )
+
+    result["cumulative_margin_kg"] = (
+        result["actual_cumulative_removed_kg"]
+        - result["target_cumulative_removed_kg"]
+    )
+
+    result["target_moisture_wb_pct"] = pd.to_numeric(
+        target_profile["target_product_moisture_wb_pct"],
+        errors="coerce",
+    ).to_numpy()
+
+    result["actual_moisture_wb_pct"] = pd.to_numeric(
+        coupled_profile["zonal_average_moisture_end_wb_pct"],
+        errors="coerce",
+    ).to_numpy()
+
+    target_reached_series = (
+        coupled_profile["all_zones_target_reached"]
+        .fillna(False)
+        .astype(bool)
+        .to_numpy()
+    )
+
+    result["actual_target_reached"] = target_reached_series
+
+    # "Відставання" перевіряємо лише до фактичного виконання цілі.
+    if target_reached_series.any():
+        first_reached_pos = int(
+            np.flatnonzero(target_reached_series)[0]
+        )
+    else:
+        first_reached_pos = len(result) - 1
+
+    before_or_at_completion = (
+        np.arange(len(result)) <= first_reached_pos
+    )
+
+    result["behind_target_schedule"] = (
+        (
+            result["cumulative_margin_kg"].to_numpy()
+            < -tolerance_kg
+        )
+        & before_or_at_completion
+    )
+
+    result["schedule_status"] = "випередження/виконання"
+
+    result.loc[
+        result["behind_target_schedule"],
+        "schedule_status",
+    ] = "відставання"
+
+    result.loc[
+        result["actual_target_reached"],
+        "schedule_status",
+    ] = "кінцева вологість досягнута"
+
+    active_target_mask = (
+        result["required_rate_kg_h"] > 0
+    )
+
+    active_actual_mask = (
+        result["actual_removed_interval_kg"] > tolerance_kg
+    )
+
+    required_active_hours = (
+        int(active_target_mask.sum()) * dt_h
+    )
+
+    actual_active_hours = (
+        int(active_actual_mask.sum()) * dt_h
+    )
+
+    required_average_rate = (
+        water_to_remove_kg / required_active_hours
+        if required_active_hours > 0
+        else float("nan")
+    )
+
+    actual_total_removed = float(
+        result["actual_removed_interval_kg"].sum()
+    )
+
+    actual_average_rate = (
+        actual_total_removed / actual_active_hours
+        if actual_active_hours > 0
+        else 0.0
+    )
+
+    productivity_factor = (
+        actual_average_rate / required_average_rate
+        if required_average_rate > 0
+        else float("nan")
+    )
+
+    productivity_reserve_pct = (
+        (productivity_factor - 1.0) * 100.0
+        if np.isfinite(productivity_factor)
+        else float("nan")
+    )
+
+    active_time_reserve_h = (
+        required_active_hours - actual_active_hours
+    )
+
+    completion_criterion_met = bool(
+        actual_total_removed
+        >= water_to_remove_kg - tolerance_kg
+    )
+
+    behind_intervals = int(
+        result["behind_target_schedule"].sum()
+    )
+
+    minimum_cumulative_margin = float(
+        result.loc[
+            before_or_at_completion,
+            "cumulative_margin_kg",
+        ].min()
+    )
+
+    maximum_cumulative_lead = float(
+        result["cumulative_margin_kg"].max()
+    )
+
+    # Completion clock time:
+    # row timestamp is the START of the last calculation interval,
+    # therefore add Δt to obtain the end of the interval.
+    completion_time = None
+
+    if completion_criterion_met and target_reached_series.any():
+        completion_row = coupled_profile.iloc[first_reached_pos]
+
+        if "time_local" in coupled_profile.columns:
+            try:
+                completion_start = pd.to_datetime(
+                    completion_row["time_local"]
+                )
+                completion_time = str(
+                    completion_start
+                    + pd.Timedelta(minutes=int(step_minutes))
+                )
+            except Exception:
+                completion_time = None
+        else:
+            try:
+                completion_start = pd.to_datetime(
+                    coupled_profile.index[first_reached_pos]
+                )
+                completion_time = str(
+                    completion_start
+                    + pd.Timedelta(minutes=int(step_minutes))
+                )
+            except Exception:
+                completion_time = None
+
+    summary = {
+        "water_to_remove_kg": float(water_to_remove_kg),
+        "actual_total_removed_kg": actual_total_removed,
+        "required_active_hours": float(required_active_hours),
+        "actual_active_hours": float(actual_active_hours),
+        "required_average_rate_kg_h": float(required_average_rate),
+        "actual_average_rate_kg_h": float(actual_average_rate),
+        "productivity_factor": float(productivity_factor),
+        "productivity_reserve_pct": float(productivity_reserve_pct),
+        "active_time_reserve_h": float(active_time_reserve_h),
+        "completion_criterion_met": completion_criterion_met,
+        "completion_time": completion_time,
+        "behind_schedule_intervals": behind_intervals,
+        "minimum_cumulative_margin_kg": minimum_cumulative_margin,
+        "maximum_cumulative_lead_kg": maximum_cumulative_lead,
+        "schedule_never_behind_until_completion": (
+            behind_intervals == 0
+        ),
+    }
+
+    return result, summary
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -2540,7 +2850,7 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–15: вихідні дані, масовий баланс, режими, "
+    "Етапи 1–16: вихідні дані, масовий баланс, режими, "
     "погодні дані, психрометрія, геометрія, кінетика Page, "
     "рівноважна вологість та формування системи "
     "тепло- і масообміну сушильної камери."
@@ -2553,7 +2863,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -2565,6 +2875,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "8. Рівноважна вологість",
         "9. Тепло- і масообмін",
         "10. Спільний розрахунок сушіння",
+        "11. Перевірка продуктивності",
     ]
 )
 
@@ -5087,9 +5398,348 @@ with tab_coupled:
                 "валідації."
             )
 
+# ---------------------------------------------------------------------
+# 11. ПЕРЕВІРКА ПРОДУКТИВНОСТІ СУШІННЯ
+# ---------------------------------------------------------------------
+with tab_performance:
+    st.subheader(
+        "Етап 16. Перевірка забезпечення потрібної "
+        "швидкості видалення води"
+    )
+
+    st.info(
+        "На цьому етапі цільова траєкторія з пункту 10 "
+        "порівнюється з фактичною зональною кінетикою з пункту 15. "
+        "Основним критерієм є не миттєва швидкість після дострокового "
+        "завершення сушіння, а накопичувальне виконання заданого "
+        "графіка видалення води."
+    )
+
+    st.markdown("#### Основні критерії")
+
+    st.latex(
+        r"\Delta\dot m_{\mathrm{в}}(t)"
+        r"=\dot m_{\mathrm{в,факт}}(t)"
+        r"-\dot m_{\mathrm{в,потр}}(t)"
+    )
+
+    st.latex(
+        r"\Delta m_{\Sigma}(t)"
+        r"=m_{\mathrm{в,факт},\Sigma}(t)"
+        r"-m_{\mathrm{в,ціль},\Sigma}(t)"
+    )
+
+    st.latex(
+        r"K_{\mathrm{прод}}"
+        r"=\frac{\overline{\dot m}_{\mathrm{в,факт}}}"
+        r"{\overline{\dot m}_{\mathrm{в,потр}}}"
+    )
+
+    st.latex(
+        r"\Delta\tau"
+        r"=\tau_{\mathrm{актив,потр}}"
+        r"-\tau_{\mathrm{актив,факт}}"
+    )
+
+    st.write(
+        "Якщо ΔmΣ(t)<0 до моменту досягнення кінцевої вологості, "
+        "сушарка відстає від цільового графіка. Якщо кінцева "
+        "вологість досягнута раніше, нульова швидкість після цього "
+        "не вважається дефіцитом продуктивності."
+    )
+
+    if "coupled_drying_profile" not in st.session_state:
+        st.warning(
+            "Спочатку виконайте етап 15 у вкладці "
+            "«Спільний розрахунок сушіння»."
+        )
+
+    elif (
+        "required_moisture_removal_profile"
+        not in st.session_state
+    ):
+        st.warning(
+            "Спочатку сформуйте цільовий профіль у пункті 10."
+        )
+
+    else:
+        actual16 = st.session_state[
+            "coupled_drying_profile"
+        ]
+
+        target16 = st.session_state[
+            "required_moisture_removal_profile"
+        ]
+
+        balance16 = calculate_mass_balance(
+            float(initial_mass_kg),
+            float(product["initial_moisture_pct"]),
+            float(product["final_moisture_pct"]),
+        )
+
+        try:
+            performance_profile, performance_summary = (
+                evaluate_drying_performance_stage16(
+                    coupled_profile=actual16,
+                    target_profile=target16,
+                    water_to_remove_kg=float(
+                        balance16["water_to_remove_kg"]
+                    ),
+                    step_minutes=int(model_step_minutes),
+                )
+            )
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.session_state[
+                "drying_performance_profile"
+            ] = performance_profile
+
+            st.session_state[
+                "drying_performance_summary"
+            ] = performance_summary
+
+            p1, p2, p3, p4 = st.columns(4)
+
+            p1.metric(
+                "Потрібна середня швидкість",
+                (
+                    f"{performance_summary['required_average_rate_kg_h']:.4f} "
+                    "кг/год"
+                ),
+            )
+
+            p2.metric(
+                "Фактична середня швидкість",
+                (
+                    f"{performance_summary['actual_average_rate_kg_h']:.4f} "
+                    "кг/год"
+                ),
+            )
+
+            p3.metric(
+                "Коефіцієнт продуктивності",
+                (
+                    f"{performance_summary['productivity_factor']:.2f}"
+                ),
+            )
+
+            p4.metric(
+                "Розрахунковий запас продуктивності",
+                (
+                    f"{performance_summary['productivity_reserve_pct']:.1f} %"
+                ),
+            )
+
+            t1, t2, t3, t4 = st.columns(4)
+
+            t1.metric(
+                "Потрібний активний час",
+                (
+                    f"{performance_summary['required_active_hours']:.2f} "
+                    "год"
+                ),
+            )
+
+            t2.metric(
+                "Фактичний активний час",
+                (
+                    f"{performance_summary['actual_active_hours']:.2f} "
+                    "год"
+                ),
+            )
+
+            t3.metric(
+                "Запас активного часу",
+                (
+                    f"{performance_summary['active_time_reserve_h']:.2f} "
+                    "год"
+                ),
+            )
+
+            t4.metric(
+                "Інтервали відставання від графіка",
+                str(
+                    performance_summary[
+                        "behind_schedule_intervals"
+                    ]
+                ),
+            )
+
+            if performance_summary[
+                "completion_criterion_met"
+            ]:
+                if performance_summary[
+                    "schedule_never_behind_until_completion"
+                ]:
+                    st.success(
+                        "Поточна модель прогнозує, що сушарка "
+                        "забезпечує потрібну продуктивність і не "
+                        "відстає від накопичувального цільового "
+                        "графіка до моменту досягнення кінцевої "
+                        "вологості."
+                    )
+                else:
+                    st.warning(
+                        "Кінцеву вологість досягнуто, але на окремих "
+                        "інтервалах накопичувальний фактичний профіль "
+                        "відставав від цільового графіка."
+                    )
+            else:
+                st.error(
+                    "За заданої тривалості процесу модель не забезпечує "
+                    "видалення всієї потрібної маси води."
+                )
+
+            if performance_summary["completion_time"]:
+                st.write(
+                    "Розрахунковий момент завершення сушіння "
+                    "(кінець останнього розрахункового інтервалу): "
+                    f"**{performance_summary['completion_time']}**."
+                )
+
+            st.markdown(
+                "#### Порівняння миттєвої швидкості"
+            )
+
+            rate_chart = performance_profile[
+                [
+                    "required_rate_kg_h",
+                    "actual_rate_kg_h",
+                ]
+            ].rename(
+                columns={
+                    "required_rate_kg_h": (
+                        "Потрібна швидкість, кг/год"
+                    ),
+                    "actual_rate_kg_h": (
+                        "Фактична швидкість, кг/год"
+                    ),
+                }
+            )
+
+            st.line_chart(
+                rate_chart,
+                use_container_width=True,
+            )
+
+            st.caption(
+                "Після дострокового досягнення 13 % фактична "
+                "швидкість стає нульовою. Це не означає дефіцит: "
+                "технологічна ціль уже виконана."
+            )
+
+            st.markdown(
+                "#### Накопичувальне видалення води"
+            )
+
+            cumulative_chart = performance_profile[
+                [
+                    "target_cumulative_removed_kg",
+                    "actual_cumulative_removed_kg",
+                ]
+            ].rename(
+                columns={
+                    "target_cumulative_removed_kg": (
+                        "Цільове накопичувальне видалення, кг"
+                    ),
+                    "actual_cumulative_removed_kg": (
+                        "Фактичне накопичувальне видалення, кг"
+                    ),
+                }
+            )
+
+            st.line_chart(
+                cumulative_chart,
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Запас / дефіцит відносно цільового графіка"
+            )
+
+            st.line_chart(
+                performance_profile[
+                    ["cumulative_margin_kg"]
+                ].rename(
+                    columns={
+                        "cumulative_margin_kg": (
+                            "ΔmΣ, кг"
+                        )
+                    }
+                ),
+                use_container_width=True,
+            )
+
+            st.write(
+                "Мінімальний накопичувальний запас до завершення: "
+                f"**{performance_summary['minimum_cumulative_margin_kg']:.4f} кг**."
+            )
+
+            st.write(
+                "Максимальне випередження цільового графіка: "
+                f"**{performance_summary['maximum_cumulative_lead_kg']:.4f} кг**."
+            )
+
+            # Methodological warning from stage 15.
+            if "coupled_drying_summary" in st.session_state:
+                stage15_summary = st.session_state[
+                    "coupled_drying_summary"
+                ]
+
+                extrapolation_share = float(
+                    stage15_summary.get(
+                        "source_extrapolated_removed_fraction_pct",
+                        0.0,
+                    )
+                )
+
+                if extrapolation_share > 0:
+                    st.warning(
+                        "Запас продуктивності вище є прогнозом "
+                        "поточної математичної моделі, а не вже "
+                        "експериментально підтвердженим запасом. "
+                        f"Приблизно {extrapolation_share:.1f} % "
+                        "видаленої води в етапі 15 припадає на "
+                        "область екстраполяції Page за початковим "
+                        "вологовмістом продукту."
+                    )
+
+            st.dataframe(
+                performance_profile[
+                    [
+                        "operating_mode",
+                        "required_rate_kg_h",
+                        "actual_rate_kg_h",
+                        "rate_difference_kg_h",
+                        "target_cumulative_removed_kg",
+                        "actual_cumulative_removed_kg",
+                        "cumulative_margin_kg",
+                        "target_moisture_wb_pct",
+                        "actual_moisture_wb_pct",
+                        "schedule_status",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+            st.download_button(
+                "Завантажити перевірку продуктивності",
+                data=dataframe_to_csv_bytes(
+                    performance_profile
+                ),
+                file_name=(
+                    "stage16_drying_performance_check.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_stage16_performance",
+            )
+
             st.info(
-                "Після вибору реальної схеми повітророзподілу "
-                "можна переходити до пункту 16 — перевірки "
-                "запасу/дефіциту продуктивності сушіння."
+                "Наступний етап — пункт 17: розрахунок теплоти "
+                "на нагрівання сушильного агента. На цьому етапі "
+                "почнеться формування власне теплової потреби "
+                "установки."
             )
 
