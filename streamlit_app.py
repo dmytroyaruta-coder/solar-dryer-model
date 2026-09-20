@@ -3165,6 +3165,327 @@ def calculate_air_heating_demand_stage17(
 
     return result, summary
 
+
+def calculate_evaporation_energy_stage18(
+    coupled_profile: pd.DataFrame,
+    zone_profile: pd.DataFrame,
+    step_minutes: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | int]]:
+    """
+    Пункт 18. Енергія, пов'язана з фазовим переходом води.
+
+    Для кожної зони:
+        h_g(T)  ≈ 2501 + 1.86*T       [кДж/кг води]
+        h_f(T)  ≈ 4.186*T             [кДж/кг води]
+        h_fg(T) = h_g - h_f
+                ≈ 2501 - 2.326*T      [кДж/кг води]
+
+    Як тимчасову температуру фазового переходу до розрахунку
+    температури продукту (п.19) використовуємо середню температуру
+    сушильного агента в межах відповідної зони:
+
+        T_ref = (T_air,in + T_air,out)/2
+
+    Тоді:
+        Q_evap,zone = Δm_w * h_fg(T_ref)
+
+    і середня потужність за часовий крок:
+        Qdot_evap = Q_evap / Δt
+
+    ВАЖЛИВО:
+    Q_evap на цьому етапі є окремою енергетичною характеристикою
+    фазового переходу. Вона НЕ додається автоматично до теплоти
+    попереднього нагрівання повітря з п.17, оскільки в зональній
+    моделі випаровування вже супроводжується зміною ентальпійного
+    стану сушильного агента. Остаточний зовнішній тепловий баланс
+    буде сформовано після розрахунку всіх складових.
+
+    Після появи T_product(t) у п.19 цей розрахунок слід уточнити,
+    використавши температуру продукту/поверхні замість T_ref.
+    """
+    import numpy as np
+
+    required_main = {
+        "actual_water_removed_interval_kg",
+        "active_drying_command",
+    }
+
+    required_zone = {
+        "time_position",
+        "zone",
+        "actual_water_removed_total_kg",
+        "air_inlet_temp_c",
+        "air_outlet_temp_c",
+    }
+
+    missing_main = required_main - set(coupled_profile.columns)
+    missing_zone = required_zone - set(zone_profile.columns)
+
+    if missing_main:
+        raise ValueError(
+            "Для етапу 18 у часовому профілі відсутні параметри: "
+            + ", ".join(sorted(missing_main))
+        )
+
+    if missing_zone:
+        raise ValueError(
+            "Для етапу 18 у зональному профілі відсутні параметри: "
+            + ", ".join(sorted(missing_zone))
+        )
+
+    if step_minutes <= 0:
+        raise ValueError(
+            "Крок моделювання має бути більшим за нуль."
+        )
+
+    zone_result = zone_profile.copy()
+
+    zone_result["evaporation_reference_temp_c"] = (
+        pd.to_numeric(
+            zone_result["air_inlet_temp_c"],
+            errors="coerce",
+        )
+        + pd.to_numeric(
+            zone_result["air_outlet_temp_c"],
+            errors="coerce",
+        )
+    ) / 2.0
+
+    t_ref = zone_result["evaporation_reference_temp_c"]
+
+    # Approximate liquid-water enthalpy relative to 0 °C.
+    zone_result["liquid_water_enthalpy_kj_kg"] = (
+        4.186 * t_ref
+    )
+
+    # ASHRAE approximate water-vapour enthalpy relative to 0 °C.
+    zone_result["water_vapour_enthalpy_kj_kg"] = (
+        2501.0 + 1.86 * t_ref
+    )
+
+    zone_result["latent_heat_vaporization_kj_kg"] = (
+        zone_result["water_vapour_enthalpy_kj_kg"]
+        - zone_result["liquid_water_enthalpy_kj_kg"]
+    )
+
+    removed_zone_kg = pd.to_numeric(
+        zone_result["actual_water_removed_total_kg"],
+        errors="coerce",
+    ).fillna(0.0)
+
+    zone_result["evaporation_energy_kj"] = (
+        removed_zone_kg
+        * zone_result["latent_heat_vaporization_kj_kg"]
+    )
+
+    zone_result["evaporation_energy_kwh"] = (
+        zone_result["evaporation_energy_kj"] / 3600.0
+    )
+
+    dt_s = float(step_minutes) * 60.0
+
+    zone_result["evaporation_power_kw"] = (
+        zone_result["evaporation_energy_kj"] / dt_s
+    )
+
+    # -----------------------------------------------------------------
+    # Aggregate all zones to the model time step.
+    # -----------------------------------------------------------------
+    grouped = (
+        zone_result
+        .groupby("time_position", sort=True)
+        .agg(
+            evaporation_water_removed_kg=(
+                "actual_water_removed_total_kg",
+                "sum",
+            ),
+            evaporation_energy_kj=(
+                "evaporation_energy_kj",
+                "sum",
+            ),
+            evaporation_energy_kwh=(
+                "evaporation_energy_kwh",
+                "sum",
+            ),
+        )
+    )
+
+    # Water-removal-weighted reference temperature and h_fg.
+    weighted_rows = []
+
+    for time_position, group in zone_result.groupby(
+        "time_position",
+        sort=True,
+    ):
+        weights = pd.to_numeric(
+            group["actual_water_removed_total_kg"],
+            errors="coerce",
+        ).fillna(0.0)
+
+        weight_sum = float(weights.sum())
+
+        if weight_sum > 0:
+            weighted_t = float(
+                (
+                    group["evaporation_reference_temp_c"]
+                    * weights
+                ).sum()
+                / weight_sum
+            )
+
+            weighted_hfg = float(
+                (
+                    group["latent_heat_vaporization_kj_kg"]
+                    * weights
+                ).sum()
+                / weight_sum
+            )
+        else:
+            weighted_t = float("nan")
+            weighted_hfg = float("nan")
+
+        weighted_rows.append(
+            {
+                "time_position": int(time_position),
+                "evaporation_reference_temp_c": weighted_t,
+                "latent_heat_vaporization_kj_kg": weighted_hfg,
+            }
+        )
+
+    weighted_df = (
+        pd.DataFrame(weighted_rows)
+        .set_index("time_position")
+        if weighted_rows
+        else pd.DataFrame()
+    )
+
+    grouped = grouped.join(
+        weighted_df,
+        how="left",
+    )
+
+    grouped["evaporation_power_kw"] = (
+        grouped["evaporation_energy_kj"] / dt_s
+    )
+
+    result = coupled_profile.copy()
+
+    result["time_position"] = range(len(result))
+
+    grouped_for_merge = grouped.reset_index()
+
+    result = result.merge(
+        grouped_for_merge,
+        on="time_position",
+        how="left",
+        suffixes=("", "_stage18"),
+    )
+
+    numeric_fill_zero = [
+        "evaporation_water_removed_kg",
+        "evaporation_energy_kj",
+        "evaporation_energy_kwh",
+        "evaporation_power_kw",
+    ]
+
+    for col in numeric_fill_zero:
+        result[col] = pd.to_numeric(
+            result[col],
+            errors="coerce",
+        ).fillna(0.0)
+
+    result["evaporation_energy_kwh_cumulative"] = (
+        result["evaporation_energy_kwh"].cumsum()
+    )
+
+    # Cross-check against water removed in the main stage-15 profile.
+    result["evaporation_water_balance_error_kg"] = (
+        result["evaporation_water_removed_kg"]
+        - pd.to_numeric(
+            result["actual_water_removed_interval_kg"],
+            errors="coerce",
+        ).fillna(0.0)
+    )
+
+    total_removed_kg = float(
+        result["evaporation_water_removed_kg"].sum()
+    )
+
+    total_evap_kwh = float(
+        result["evaporation_energy_kwh"].sum()
+    )
+
+    positive = result.loc[
+        result["evaporation_water_removed_kg"] > 0
+    ]
+
+    peak_evap_power_kw = (
+        float(positive["evaporation_power_kw"].max())
+        if not positive.empty
+        else 0.0
+    )
+
+    mean_evap_power_kw = (
+        float(positive["evaporation_power_kw"].mean())
+        if not positive.empty
+        else 0.0
+    )
+
+    weighted_mean_hfg = (
+        float(
+            zone_result["evaporation_energy_kj"].sum()
+            / total_removed_kg
+        )
+        if total_removed_kg > 0
+        else float("nan")
+    )
+
+    weights_all = pd.to_numeric(
+        zone_result["actual_water_removed_total_kg"],
+        errors="coerce",
+    ).fillna(0.0)
+
+    weighted_mean_tref = (
+        float(
+            (
+                zone_result["evaporation_reference_temp_c"]
+                * weights_all
+            ).sum()
+            / weights_all.sum()
+        )
+        if float(weights_all.sum()) > 0
+        else float("nan")
+    )
+
+    specific_evap_kwh_per_kg = (
+        total_evap_kwh / total_removed_kg
+        if total_removed_kg > 0
+        else float("nan")
+    )
+
+    max_water_balance_error_kg = float(
+        result["evaporation_water_balance_error_kg"]
+        .abs()
+        .max()
+    )
+
+    summary = {
+        "total_water_evaporated_kg": total_removed_kg,
+        "total_evaporation_energy_kwh": total_evap_kwh,
+        "peak_evaporation_power_kw": peak_evap_power_kw,
+        "mean_evaporation_power_kw": mean_evap_power_kw,
+        "weighted_mean_reference_temp_c": weighted_mean_tref,
+        "weighted_mean_latent_heat_kj_kg": weighted_mean_hfg,
+        "specific_evaporation_energy_kwh_per_kg": (
+            specific_evap_kwh_per_kg
+        ),
+        "max_water_balance_error_kg": (
+            max_water_balance_error_kg
+        ),
+    }
+
+    return result, zone_result, summary
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -3180,7 +3501,7 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–17: вихідні дані, масовий баланс, режими, "
+    "Етапи 1–18: вихідні дані, масовий баланс, режими, "
     "погодні дані, психрометрія, геометрія, кінетика Page, "
     "рівноважна вологість та формування системи "
     "тепло- і масообміну сушильної камери."
@@ -3193,7 +3514,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -3207,6 +3528,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "10. Спільний розрахунок сушіння",
         "11. Перевірка продуктивності",
         "12. Нагрівання сушильного агента",
+        "13. Випаровування вологи",
     ]
 )
 
@@ -6373,10 +6695,321 @@ with tab_air_heating:
                 key="download_stage17_air_heating",
             )
 
+# ---------------------------------------------------------------------
+# 13. ЕНЕРГІЯ ФАЗОВОГО ПЕРЕХОДУ ВОДИ
+# ---------------------------------------------------------------------
+with tab_evaporation:
+    st.subheader(
+        "Етап 18. Розрахунок теплоти на випаровування вологи"
+    )
+
+    st.info(
+        "На цьому етапі визначається енергія, фізично пов'язана "
+        "з переходом видаленої з продукту води з рідкої фази "
+        "у парову. Це окрема енергетична характеристика процесу."
+    )
+
+    st.markdown("#### Теплота фазового переходу")
+
+    st.write(
+        "Для водяної пари використовується наближене "
+        "психрометричне співвідношення:"
+    )
+
+    st.latex(
+        r"h_g(T)\approx2501+1.86T"
+    )
+
+    st.write(
+        "Для рідкої води у розглянутому температурному діапазоні:"
+    )
+
+    st.latex(
+        r"h_f(T)\approx4.186T"
+    )
+
+    st.write(
+        "Тоді питома теплота пароутворення:"
+    )
+
+    st.latex(
+        r"h_{fg}(T)"
+        r"=h_g-h_f"
+        r"\approx2501-2.326T"
+    )
+
+    st.write(
+        "Енергія фазового переходу в окремій розрахунковій зоні:"
+    )
+
+    st.latex(
+        r"\Delta Q_{\mathrm{вип},j}"
+        r"=\Delta m_{\mathrm{в},j}"
+        r"h_{fg}(T_{\mathrm{ref},j})"
+    )
+
+    st.write(
+        "Середня потужність фазового переходу за один часовий крок:"
+    )
+
+    st.latex(
+        r"\dot Q_{\mathrm{вип},i}"
+        r"=\frac{\sum_j\Delta Q_{\mathrm{вип},i,j}}{\Delta t}"
+    )
+
+    st.warning(
+        "Температура самого зерна ще не розрахована. Тому на цьому "
+        "етапі Tref приймається як середня температура сушильного "
+        "агента між входом і виходом відповідної зони. Це тимчасове "
+        "наближення. Після розрахунку температури продукту в п.19 "
+        "теплоту пароутворення потрібно буде уточнити."
+    )
+
+    st.error(
+        "Qвип НЕ додається автоматично до Qпов із п.17. "
+        "У поточній зональній моделі випаровування вже супроводжується "
+        "зміною ентальпії сушильного агента. Просте складання "
+        "Qпов + Qвип до формування повного енергетичного балансу "
+        "може призвести до подвійного врахування тієї самої енергії."
+    )
+
+    if "coupled_drying_profile" not in st.session_state:
+        st.warning(
+            "Спочатку виконайте етап 15."
+        )
+
+    elif "coupled_drying_zone_profile" not in st.session_state:
+        st.warning(
+            "Для етапу 18 потрібна деталізація по зонах з етапу 15."
+        )
+
+    else:
+        main18 = st.session_state[
+            "coupled_drying_profile"
+        ]
+
+        zones18 = st.session_state[
+            "coupled_drying_zone_profile"
+        ]
+
+        try:
+            (
+                evaporation_profile,
+                evaporation_zone_profile,
+                evaporation_summary,
+            ) = calculate_evaporation_energy_stage18(
+                coupled_profile=main18,
+                zone_profile=zones18,
+                step_minutes=int(model_step_minutes),
+            )
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.session_state[
+                "evaporation_energy_profile"
+            ] = evaporation_profile
+
+            st.session_state[
+                "evaporation_energy_zone_profile"
+            ] = evaporation_zone_profile
+
+            st.session_state[
+                "evaporation_energy_summary"
+            ] = evaporation_summary
+
+            e1, e2, e3, e4 = st.columns(4)
+
+            e1.metric(
+                "Випарувано води",
+                (
+                    f"{evaporation_summary['total_water_evaporated_kg']:.3f} "
+                    "кг"
+                ),
+            )
+
+            e2.metric(
+                "Енергія фазового переходу",
+                (
+                    f"{evaporation_summary['total_evaporation_energy_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            e3.metric(
+                "Пікова потужність випаровування",
+                (
+                    f"{evaporation_summary['peak_evaporation_power_kw']:.2f} "
+                    "кВт"
+                ),
+            )
+
+            e4.metric(
+                "Середня потужність випаровування",
+                (
+                    f"{evaporation_summary['mean_evaporation_power_kw']:.2f} "
+                    "кВт"
+                ),
+            )
+
+            e5, e6, e7 = st.columns(3)
+
+            e5.metric(
+                "Середня Tref",
+                (
+                    f"{evaporation_summary['weighted_mean_reference_temp_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            e6.metric(
+                "Середня hfg",
+                (
+                    f"{evaporation_summary['weighted_mean_latent_heat_kj_kg']:.1f} "
+                    "кДж/кг"
+                ),
+            )
+
+            e7.metric(
+                "На 1 кг випаруваної води",
+                (
+                    f"{evaporation_summary['specific_evaporation_energy_kwh_per_kg']:.3f} "
+                    "кВт·год/кг"
+                ),
+            )
+
+            if (
+                evaporation_summary[
+                    "max_water_balance_error_kg"
+                ]
+                <= 1e-9
+            ):
+                st.success(
+                    "Маса води у розрахунку фазового переходу "
+                    "повністю узгоджується з масою води, видаленою "
+                    "у зональній моделі етапу 15."
+                )
+            else:
+                st.warning(
+                    "Виявлено розбіжність між масою води у п.15 "
+                    "і п.18. Максимальна похибка за інтервал: "
+                    f"{evaporation_summary['max_water_balance_error_kg']:.6f} кг."
+                )
+
+            st.markdown(
+                "#### Потужність фазового переходу"
+            )
+
+            st.line_chart(
+                evaporation_profile[
+                    ["evaporation_power_kw"]
+                ].rename(
+                    columns={
+                        "evaporation_power_kw": (
+                            "Q̇вип, кВт"
+                        )
+                    }
+                ),
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Накопичена енергія фазового переходу"
+            )
+
+            st.line_chart(
+                evaporation_profile[
+                    ["evaporation_energy_kwh_cumulative"]
+                ].rename(
+                    columns={
+                        "evaporation_energy_kwh_cumulative": (
+                            "Qвип,Σ, кВт·год"
+                        )
+                    }
+                ),
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Референсна температура та питома теплота пароутворення"
+            )
+
+            ref_chart = evaporation_profile[
+                [
+                    "evaporation_reference_temp_c",
+                    "latent_heat_vaporization_kj_kg",
+                ]
+            ]
+
+            st.dataframe(
+                evaporation_profile[
+                    [
+                        "operating_mode",
+                        "actual_water_removed_interval_kg",
+                        "evaporation_water_removed_kg",
+                        "evaporation_reference_temp_c",
+                        "latent_heat_vaporization_kj_kg",
+                        "evaporation_power_kw",
+                        "evaporation_energy_kwh",
+                        "evaporation_energy_kwh_cumulative",
+                        "evaporation_water_balance_error_kg",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Деталізація фазового переходу по зонах"
+            )
+
+            st.dataframe(
+                evaporation_zone_profile[
+                    [
+                        "time_position",
+                        "zone",
+                        "actual_water_removed_total_kg",
+                        "air_inlet_temp_c",
+                        "air_outlet_temp_c",
+                        "evaporation_reference_temp_c",
+                        "liquid_water_enthalpy_kj_kg",
+                        "water_vapour_enthalpy_kj_kg",
+                        "latent_heat_vaporization_kj_kg",
+                        "evaporation_energy_kwh",
+                        "evaporation_power_kw",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+            st.download_button(
+                "Завантажити розрахунок теплоти випаровування",
+                data=dataframe_to_csv_bytes(
+                    evaporation_profile
+                ),
+                file_name=(
+                    "stage18_evaporation_energy.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_stage18_evaporation",
+            )
+
+            st.download_button(
+                "Завантажити деталізацію випаровування по зонах",
+                data=dataframe_to_csv_bytes(
+                    evaporation_zone_profile
+                ),
+                file_name=(
+                    "stage18_evaporation_energy_zones.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_stage18_evaporation_zones",
+            )
+
             st.info(
-                "Наступний етап — пункт 18: розрахунок теплоти "
-                "на випаровування вологи. Після цього теплову "
-                "потребу на нагрівання повітря та випаровування "
-                "можна буде аналізувати спільно."
+                "Наступний етап — пункт 19: розрахунок теплоти "
+                "на нагрівання продукту. Там з'явиться температура "
+                "продукту, після чого Tref у розрахунку hfg можна "
+                "буде уточнити."
             )
 
