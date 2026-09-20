@@ -3381,6 +3381,19 @@ def calculate_evaporation_energy_stage18(
         suffixes=("", "_stage18"),
     )
 
+    # Restore the real local-time axis after merge(), because pandas
+    # otherwise replaces the datetime index with a numeric RangeIndex.
+    if "time_local" in result.columns:
+        result["time_local"] = pd.to_datetime(
+            result["time_local"],
+            errors="coerce",
+        )
+        if result["time_local"].notna().any():
+            result = result.set_index(
+                "time_local",
+                drop=False,
+            )
+
     numeric_fill_zero = [
         "evaporation_water_removed_kg",
         "evaporation_energy_kj",
@@ -3486,6 +3499,367 @@ def calculate_evaporation_energy_stage18(
 
     return result, zone_result, summary
 
+
+def wheat_moist_specific_heat_kj_kg_k(
+    moisture_wb_fraction,
+    dry_matter_cp_kj_kg_k: float = 1.550,
+    water_cp_kj_kg_k: float = 4.186,
+):
+    """
+    Specific heat capacity of moist wheat as a mass-weighted mixture:
+
+        cp,wheat = (1 - w) * cp,dry + w * cp,water
+
+    where w is moisture fraction on wet basis.
+
+    The dry-matter value cp,dry = 1.550 kJ/(kg·K) is taken from:
+    Kharchenko Y., Chornyi V., Sharan A. (2020),
+    "Influence of water temperature and moisture increase on wheat
+    temperature during moistening", Ukrainian Journal of Food Science,
+    8(1), 58–67, DOI 10.24263/2310-1008-2020-8-1-7.
+
+    Water cp is taken as 4.186 kJ/(kg·K) in the current temperature
+    range.
+
+    This function gives a thermophysical property; it does NOT solve
+    the transient temperature of the grain.
+    """
+    import numpy as np
+
+    w = pd.Series(
+        moisture_wb_fraction,
+        dtype="float64",
+    )
+
+    w = w.clip(lower=0.0, upper=1.0)
+
+    return (
+        (1.0 - w) * float(dry_matter_cp_kj_kg_k)
+        + w * float(water_cp_kj_kg_k)
+    )
+
+
+def calculate_product_sensible_heat_stage19(
+    coupled_profile: pd.DataFrame,
+    dry_matter_kg: float,
+    initial_total_mass_kg: float,
+    initial_x_db: float,
+    target_x_db: float,
+    initial_product_temp_c: float,
+    reference_product_temp_c: float,
+    active_drying_hours: float,
+    dry_matter_cp_kj_kg_k: float = 1.550,
+    water_cp_kj_kg_k: float = 4.186,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    """
+    Stage 19: sensible heat associated with warming the product.
+
+    This stage does NOT invent a transient T_product(t), because the
+    full product-temperature equation requires heat-transfer data
+    (h_a-p, a_s, etc.) not yet justified.
+
+    Instead, it calculates a transparent design heat requirement for
+    warming the initial wet product from T_p,0 to a selected reference
+    product temperature T_p,ref:
+
+        Q_p,sens =
+            [m_dry * cp,dry + m_w,0 * cp,w] * (T_p,ref - T_p,0)
+
+    This is equivalent to:
+        Q_p,sens = m_0 * cp,wet,0 * DeltaT
+
+    The result is decomposed into:
+    - dry matter sensible heat;
+    - sensible heat of water that remains in the final product;
+    - sensible heat of the water that is later evaporated.
+
+    The latter is useful because h_fg in stage 18 contains latent heat
+    at the phase-change temperature, but not the sensible heating of
+    liquid water from the initial product temperature up to that
+    reference temperature.
+
+    IMPORTANT:
+    This stage produces an energy requirement / design estimate,
+    not a validated dynamic product-temperature trajectory.
+    """
+    import numpy as np
+
+    if dry_matter_kg <= 0:
+        raise ValueError(
+            "Маса сухої речовини має бути більшою за нуль."
+        )
+
+    if initial_total_mass_kg <= 0:
+        raise ValueError(
+            "Початкова маса продукту має бути більшою за нуль."
+        )
+
+    if target_x_db < 0 or initial_x_db < 0:
+        raise ValueError(
+            "Вологовміст продукту не може бути від'ємним."
+        )
+
+    delta_t = (
+        float(reference_product_temp_c)
+        - float(initial_product_temp_c)
+    )
+
+    if delta_t < 0:
+        raise ValueError(
+            "Референсна температура продукту має бути не нижчою "
+            "за його початкову температуру."
+        )
+
+    water_initial_kg = (
+        float(dry_matter_kg)
+        * float(initial_x_db)
+    )
+
+    water_final_kg = (
+        float(dry_matter_kg)
+        * float(target_x_db)
+    )
+
+    water_removed_kg = max(
+        0.0,
+        water_initial_kg - water_final_kg,
+    )
+
+    final_product_mass_kg = (
+        float(dry_matter_kg)
+        + water_final_kg
+    )
+
+    w0_wb = (
+        water_initial_kg
+        / float(initial_total_mass_kg)
+    )
+
+    wf_wb = (
+        water_final_kg
+        / final_product_mass_kg
+    )
+
+    cp_initial = float(
+        wheat_moist_specific_heat_kj_kg_k(
+            pd.Series([w0_wb]),
+            dry_matter_cp_kj_kg_k=dry_matter_cp_kj_kg_k,
+            water_cp_kj_kg_k=water_cp_kj_kg_k,
+        ).iloc[0]
+    )
+
+    cp_final = float(
+        wheat_moist_specific_heat_kj_kg_k(
+            pd.Series([wf_wb]),
+            dry_matter_cp_kj_kg_k=dry_matter_cp_kj_kg_k,
+            water_cp_kj_kg_k=water_cp_kj_kg_k,
+        ).iloc[0]
+    )
+
+    q_dry_kj = (
+        float(dry_matter_kg)
+        * float(dry_matter_cp_kj_kg_k)
+        * delta_t
+    )
+
+    q_water_initial_kj = (
+        water_initial_kg
+        * float(water_cp_kj_kg_k)
+        * delta_t
+    )
+
+    q_water_final_kj = (
+        water_final_kg
+        * float(water_cp_kj_kg_k)
+        * delta_t
+    )
+
+    q_removed_water_sensible_kj = (
+        water_removed_kg
+        * float(water_cp_kj_kg_k)
+        * delta_t
+    )
+
+    q_total_kj = (
+        q_dry_kj
+        + q_water_initial_kj
+    )
+
+    q_total_kwh = (
+        q_total_kj / 3600.0
+    )
+
+    q_final_product_only_kj = (
+        q_dry_kj
+        + q_water_final_kj
+    )
+
+    q_final_product_only_kwh = (
+        q_final_product_only_kj / 3600.0
+    )
+
+    q_removed_water_sensible_kwh = (
+        q_removed_water_sensible_kj / 3600.0
+    )
+
+    equivalent_mean_power_kw = (
+        q_total_kwh / float(active_drying_hours)
+        if active_drying_hours > 0
+        else float("nan")
+    )
+
+    # -----------------------------------------------------------------
+    # Property profile from the actual moisture history of stage 15.
+    # This does not assume T_product(t); it only tracks how cp changes
+    # as water is removed.
+    # -----------------------------------------------------------------
+    profile = coupled_profile.copy()
+
+    if "zonal_average_moisture_end_wb_pct" not in profile.columns:
+        raise ValueError(
+            "Для етапу 19 відсутня фактична вологість продукту "
+            "з етапу 15."
+        )
+
+    moisture_wb_fraction = (
+        pd.to_numeric(
+            profile["zonal_average_moisture_end_wb_pct"],
+            errors="coerce",
+        )
+        / 100.0
+    )
+
+    profile[
+        "product_moisture_wb_fraction_stage19"
+    ] = moisture_wb_fraction
+
+    profile[
+        "product_specific_heat_kj_kg_k"
+    ] = wheat_moist_specific_heat_kj_kg_k(
+        moisture_wb_fraction,
+        dry_matter_cp_kj_kg_k=dry_matter_cp_kj_kg_k,
+        water_cp_kj_kg_k=water_cp_kj_kg_k,
+    )
+
+    x_actual = pd.to_numeric(
+        profile["zonal_average_x_end_db_kg_kg"],
+        errors="coerce",
+    )
+
+    profile[
+        "product_water_mass_kg_stage19"
+    ] = (
+        float(dry_matter_kg) * x_actual
+    )
+
+    profile[
+        "product_total_mass_kg_stage19"
+    ] = (
+        float(dry_matter_kg)
+        + profile["product_water_mass_kg_stage19"]
+    )
+
+    profile[
+        "product_initial_temperature_c_stage19"
+    ] = float(initial_product_temp_c)
+
+    profile[
+        "product_reference_temperature_c_stage19"
+    ] = float(reference_product_temp_c)
+
+    # -----------------------------------------------------------------
+    # Sensitivity of design sensible heat to the selected reference
+    # product temperature.
+    # -----------------------------------------------------------------
+    if delta_t > 0:
+        t_values = np.linspace(
+            float(initial_product_temp_c),
+            float(reference_product_temp_c),
+            41,
+        )
+    else:
+        t_values = np.array(
+            [float(initial_product_temp_c)]
+        )
+
+    sensitivity = pd.DataFrame(
+        {
+            "product_reference_temp_c": t_values,
+        }
+    )
+
+    sensitivity["delta_t_c"] = (
+        sensitivity["product_reference_temp_c"]
+        - float(initial_product_temp_c)
+    )
+
+    sensitivity[
+        "product_sensible_heat_kwh"
+    ] = (
+        (
+            float(dry_matter_kg)
+            * float(dry_matter_cp_kj_kg_k)
+            + water_initial_kg
+            * float(water_cp_kj_kg_k)
+        )
+        * sensitivity["delta_t_c"]
+        / 3600.0
+    )
+
+    summary = {
+        "initial_product_temp_c": (
+            float(initial_product_temp_c)
+        ),
+        "reference_product_temp_c": (
+            float(reference_product_temp_c)
+        ),
+        "delta_t_c": float(delta_t),
+        "dry_matter_cp_kj_kg_k": (
+            float(dry_matter_cp_kj_kg_k)
+        ),
+        "water_cp_kj_kg_k": (
+            float(water_cp_kj_kg_k)
+        ),
+        "initial_wet_product_cp_kj_kg_k": (
+            cp_initial
+        ),
+        "final_wet_product_cp_kj_kg_k": (
+            cp_final
+        ),
+        "water_initial_kg": (
+            float(water_initial_kg)
+        ),
+        "water_final_kg": (
+            float(water_final_kg)
+        ),
+        "water_removed_kg": (
+            float(water_removed_kg)
+        ),
+        "dry_matter_sensible_heat_kwh": (
+            q_dry_kj / 3600.0
+        ),
+        "initial_water_sensible_heat_kwh": (
+            q_water_initial_kj / 3600.0
+        ),
+        "final_product_sensible_heat_kwh": (
+            q_final_product_only_kwh
+        ),
+        "removed_water_sensible_heat_kwh": (
+            q_removed_water_sensible_kwh
+        ),
+        "total_initial_product_sensible_heat_kwh": (
+            q_total_kwh
+        ),
+        "equivalent_mean_power_kw": (
+            float(equivalent_mean_power_kw)
+        ),
+        "active_drying_hours": (
+            float(active_drying_hours)
+        ),
+    }
+
+    return profile, sensitivity, summary
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -3501,7 +3875,7 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–18: вихідні дані, масовий баланс, режими, "
+    "Етапи 1–19: вихідні дані, масовий баланс, режими, "
     "погодні дані, психрометрія, геометрія, кінетика Page, "
     "рівноважна вологість та формування системи "
     "тепло- і масообміну сушильної камери."
@@ -3514,7 +3888,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation, tab_product_heating = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -3529,6 +3903,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "11. Перевірка продуктивності",
         "12. Нагрівання сушильного агента",
         "13. Випаровування вологи",
+        "14. Нагрівання продукту",
     ]
 )
 
@@ -7006,10 +7381,421 @@ with tab_evaporation:
                 key="download_stage18_evaporation_zones",
             )
 
+# ---------------------------------------------------------------------
+# 14. НАГРІВАННЯ ПРОДУКТУ
+# ---------------------------------------------------------------------
+with tab_product_heating:
+    st.subheader(
+        "Етап 19. Розрахунок теплоти на нагрівання продукту"
+    )
+
+    st.info(
+        "На цьому етапі не задається штучна динамічна температура "
+        "зерна. Для розрахунку Tₚ(t) потрібні коефіцієнт "
+        "теплообміну повітря–зерно, питома поверхня та інші "
+        "параметри повної системи з п.14. Натомість тут "
+        "визначається прозора розрахункова теплота, необхідна "
+        "для нагрівання початкового вологого продукту від Tₚ,0 "
+        "до вибраної референсної температури Tₚ,ref."
+    )
+
+    st.markdown("#### Теплоємність вологої пшениці")
+
+    st.latex(
+        r"c_{p,\mathrm{пш}}"
+        r"=(1-W)c_{p,\mathrm{сух}}"
+        r"+Wc_{p,\mathrm{в}}"
+    )
+
+    st.write(
+        "де W — масова частка води на вологій основі."
+    )
+
+    st.latex(
+        r"c_{p,\mathrm{сух}}=1.550\ "
+        r"\mathrm{kJ/(kg\cdot K)}"
+    )
+
+    st.latex(
+        r"c_{p,\mathrm{в}}=4.186\ "
+        r"\mathrm{kJ/(kg\cdot K)}"
+    )
+
+    st.caption(
+        "Для сухої речовини пшениці використано значення "
+        "1,550 кДж/(кг·К) за Kharchenko, Chornyi & Sharan (2020), "
+        "Ukrainian Journal of Food Science, 8(1), 58–67, "
+        "DOI 10.24263/2310-1008-2020-8-1-7."
+    )
+
+    st.markdown("#### Розрахункова теплота")
+
+    st.latex(
+        r"Q_{p,\mathrm{sens}}"
+        r"=\left("
+        r"m_{\mathrm{сух}}c_{p,\mathrm{сух}}"
+        r"+m_{\mathrm{в},0}c_{p,\mathrm{в}}"
+        r"\right)"
+        r"\left(T_{p,\mathrm{ref}}-T_{p,0}\right)"
+    )
+
+    st.write(
+        "Це еквівалентно формі "
+        "Q = m₀ cₚ,волог ΔT для початкового вологого продукту."
+    )
+
+    st.warning(
+        "Цей розрахунок є енергетичною оцінкою, а не прогнозом "
+        "фактичної температурної траєкторії зерна. Значення "
+        "Tₚ,ref можна трактувати як розрахунковий температурний "
+        "рівень для оцінки sensible heat. За замовчуванням "
+        "використовується цільова температура сушильного агента "
+        "40 °C, тобто верхня консервативна оцінка для поточного етапу."
+    )
+
+    if "coupled_drying_profile" not in st.session_state:
+        st.warning(
+            "Спочатку виконайте етап 15."
+        )
+    else:
+        coupled19 = st.session_state[
+            "coupled_drying_profile"
+        ]
+
+        # Initial product temperature: by default equal to the ambient
+        # temperature at the start of the process. User can override it.
+        if (
+            "T2M" in coupled19.columns
+            and pd.notna(
+                pd.to_numeric(
+                    coupled19["T2M"],
+                    errors="coerce",
+                ).iloc[0]
+            )
+        ):
+            default_initial_product_temp = float(
+                pd.to_numeric(
+                    coupled19["T2M"],
+                    errors="coerce",
+                ).iloc[0]
+            )
+        else:
+            default_initial_product_temp = 20.0
+
+        max_product_temp = float(
+            product.get(
+                "max_product_temp_c",
+                product["target_drying_temp_c"],
+            )
+        )
+
+        default_reference_temp = min(
+            float(product["target_drying_temp_c"]),
+            max_product_temp,
+        )
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            initial_product_temp_c = st.number_input(
+                "Початкова температура продукту Tₚ,0, °C",
+                min_value=-20.0,
+                max_value=float(max_product_temp),
+                value=float(default_initial_product_temp),
+                step=0.5,
+                format="%.2f",
+                key="stage19_initial_product_temp_c",
+            )
+
+        with c2:
+            min_reference_temp = float(
+                initial_product_temp_c
+            )
+
+            safe_default_reference = max(
+                min_reference_temp,
+                float(default_reference_temp),
+            )
+
+            reference_product_temp_c = st.number_input(
+                "Референсна температура продукту Tₚ,ref, °C",
+                min_value=min_reference_temp,
+                max_value=float(max_product_temp),
+                value=float(safe_default_reference),
+                step=0.5,
+                format="%.2f",
+                key="stage19_reference_product_temp_c",
+            )
+
+        if (
+            abs(
+                initial_product_temp_c
+                - default_initial_product_temp
+            )
+            < 1e-9
+        ):
+            st.caption(
+                "Початкову температуру автоматично прийнято рівною "
+                "температурі зовнішнього повітря на початку процесу. "
+                "Якщо фактична температура зерна перед завантаженням "
+                "відома, її слід ввести вручну."
+            )
+
+        balance19 = calculate_mass_balance(
+            float(initial_mass_kg),
+            float(product["initial_moisture_pct"]),
+            float(product["final_moisture_pct"]),
+        )
+
+        if "drying_performance_summary" in st.session_state:
+            active_hours19 = float(
+                st.session_state[
+                    "drying_performance_summary"
+                ]["actual_active_hours"]
+            )
+        else:
+            active_hours19 = float(
+                (
+                    coupled19[
+                        "actual_water_removed_interval_kg"
+                    ] > 0
+                ).sum()
+                * int(model_step_minutes)
+                / 60.0
+            )
+
+        try:
+            (
+                product_heat_profile,
+                product_heat_sensitivity,
+                product_heat_summary,
+            ) = calculate_product_sensible_heat_stage19(
+                coupled_profile=coupled19,
+                dry_matter_kg=float(
+                    balance19["dry_matter_kg"]
+                ),
+                initial_total_mass_kg=float(
+                    initial_mass_kg
+                ),
+                initial_x_db=float(
+                    balance19["initial_dry_basis"]
+                ),
+                target_x_db=float(
+                    balance19["final_dry_basis"]
+                ),
+                initial_product_temp_c=float(
+                    initial_product_temp_c
+                ),
+                reference_product_temp_c=float(
+                    reference_product_temp_c
+                ),
+                active_drying_hours=float(
+                    active_hours19
+                ),
+            )
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.session_state[
+                "product_heating_profile"
+            ] = product_heat_profile
+
+            st.session_state[
+                "product_heating_sensitivity"
+            ] = product_heat_sensitivity
+
+            st.session_state[
+                "product_heating_summary"
+            ] = product_heat_summary
+
+            p1, p2, p3, p4 = st.columns(4)
+
+            p1.metric(
+                "cₚ початкового зерна",
+                (
+                    f"{product_heat_summary['initial_wet_product_cp_kj_kg_k']:.3f} "
+                    "кДж/(кг·К)"
+                ),
+            )
+
+            p2.metric(
+                "cₚ при кінцевій вологості",
+                (
+                    f"{product_heat_summary['final_wet_product_cp_kj_kg_k']:.3f} "
+                    "кДж/(кг·К)"
+                ),
+            )
+
+            p3.metric(
+                "ΔT продукту",
+                (
+                    f"{product_heat_summary['delta_t_c']:.2f} °C"
+                ),
+            )
+
+            p4.metric(
+                "Повна sensible heat оцінка",
+                (
+                    f"{product_heat_summary['total_initial_product_sensible_heat_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            q1, q2, q3, q4 = st.columns(4)
+
+            q1.metric(
+                "Нагрівання сухої речовини",
+                (
+                    f"{product_heat_summary['dry_matter_sensible_heat_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            q2.metric(
+                "Нагрівання всієї початкової води",
+                (
+                    f"{product_heat_summary['initial_water_sensible_heat_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            q3.metric(
+                "З них вода, що буде випарувана",
+                (
+                    f"{product_heat_summary['removed_water_sensible_heat_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            q4.metric(
+                "Еквівалентна середня потужність",
+                (
+                    f"{product_heat_summary['equivalent_mean_power_kw']:.3f} "
+                    "кВт"
+                ),
+            )
+
+            st.caption(
+                "Еквівалентна середня потужність = Qp,sens / "
+                "фактичний активний час сушіння. Це лише нормалізація "
+                "енергії за часом, а не реальна Q̇p(t)."
+            )
+
+            st.markdown(
+                "#### Зміна питомої теплоємності продукту під час сушіння"
+            )
+
+            st.line_chart(
+                product_heat_profile[
+                    ["product_specific_heat_kj_kg_k"]
+                ].rename(
+                    columns={
+                        "product_specific_heat_kj_kg_k": (
+                            "cₚ продукту, кДж/(кг·К)"
+                        )
+                    }
+                ),
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Чутливість Qₚ,sens до вибраної Tₚ,ref"
+            )
+
+            sensitivity_chart = (
+                product_heat_sensitivity
+                .set_index("product_reference_temp_c")[
+                    ["product_sensible_heat_kwh"]
+                ]
+                .rename(
+                    columns={
+                        "product_sensible_heat_kwh": (
+                            "Qₚ,sens, кВт·год"
+                        )
+                    }
+                )
+            )
+
+            st.line_chart(
+                sensitivity_chart,
+                use_container_width=True,
+            )
+
+            st.markdown(
+                "#### Декомпозиція sensible heat"
+            )
+
+            decomposition_df = pd.DataFrame(
+                {
+                    "Складова": [
+                        "Суха речовина",
+                        "Вся початкова вода",
+                        "Вода, що залишається у кінцевому продукті",
+                        "Вода, що буде випарувана",
+                    ],
+                    "Енергія, кВт·год": [
+                        product_heat_summary[
+                            "dry_matter_sensible_heat_kwh"
+                        ],
+                        product_heat_summary[
+                            "initial_water_sensible_heat_kwh"
+                        ],
+                        (
+                            product_heat_summary[
+                                "final_product_sensible_heat_kwh"
+                            ]
+                            - product_heat_summary[
+                                "dry_matter_sensible_heat_kwh"
+                            ]
+                        ),
+                        product_heat_summary[
+                            "removed_water_sensible_heat_kwh"
+                        ],
+                    ],
+                }
+            )
+
+            st.dataframe(
+                decomposition_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.warning(
+                "Не слід автоматично складати Qₚ,sens, Qвип і Qпов "
+                "до формування єдиного контрольного енергетичного "
+                "балансу. На цьому етапі ці величини зберігаються "
+                "окремо, щоб уникнути подвійного врахування енергії."
+            )
+
+            st.download_button(
+                "Завантажити теплофізичний профіль продукту",
+                data=dataframe_to_csv_bytes(
+                    product_heat_profile
+                ),
+                file_name=(
+                    "stage19_product_thermophysical_profile.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_stage19_product_profile",
+            )
+
+            st.download_button(
+                "Завантажити чутливість теплоти до температури",
+                data=dataframe_to_csv_bytes(
+                    product_heat_sensitivity
+                ),
+                file_name=(
+                    "stage19_product_heating_sensitivity.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_stage19_sensitivity",
+            )
+
             st.info(
-                "Наступний етап — пункт 19: розрахунок теплоти "
-                "на нагрівання продукту. Там з'явиться температура "
-                "продукту, після чого Tref у розрахунку hfg можна "
-                "буде уточнити."
+                "Наступний етап — пункт 20: розрахунок теплоти "
+                "на нагрівання конструкцій сушильної камери."
             )
 
