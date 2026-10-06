@@ -4142,6 +4142,380 @@ def calculate_construction_heating_stage20(
 
     return result, summary
 
+
+def calculate_transmission_heat_losses_stage21(
+    coupled_profile: pd.DataFrame,
+    zone_profile: pd.DataFrame,
+    envelope_df: pd.DataFrame,
+    step_minutes: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | int]]:
+    """
+    Пункт 21. Теплові втрати через огородження сушильної камери.
+
+    На цьому етапі враховуються лише трансмісійні теплові втрати
+    через корпус / двері / інші огороджувальні елементи:
+
+        Qdot_loss(t) = sum_j [U_j * A_j] * [T_ch(t) - T_amb(t)]
+
+    якщо T_ch > T_amb.
+
+    Для кожного елемента:
+        UA_j = U_j * A_j
+
+    Сумарно:
+        UA_sum = sum(UA_j)
+
+    Енергія втрат за часовий крок:
+        dQ_loss = Qdot_loss * dt
+
+    ВАЖЛИВО:
+    - тут НЕ враховуються втрати з відпрацьованим сушильним агентом;
+      вони належать до ентальпійного балансу повітря і будуть
+      пов'язані з рекуперацією на наступному етапі;
+    - тут НЕ враховується неконтрольована інфільтрація / витоки
+      через нещільності, якщо вони не визначені окремо;
+    - нічний режим не розраховується як активне сушіння. Його
+      мінімальна теплова потреба за умовою точки роси формується
+      окремо на відповідному етапі.
+
+    Репрезентативна температура всередині камери T_ch(t)
+    визначається з уже розрахованого зонального профілю:
+    для кожної зони береться середня
+        (T_air,in + T_air,out) / 2,
+    після чого усереднюється між зонами одного часового інтервалу.
+    """
+    import numpy as np
+
+    required_main = {
+        "T2M",
+        "active_drying_command",
+    }
+
+    required_zone = {
+        "time_position",
+        "air_inlet_temp_c",
+        "air_outlet_temp_c",
+    }
+
+    required_env = {
+        "include",
+        "element",
+        "area_m2",
+        "u_value_w_m2_k",
+    }
+
+    missing_main = required_main - set(coupled_profile.columns)
+    missing_zone = required_zone - set(zone_profile.columns)
+    missing_env = required_env - set(envelope_df.columns)
+
+    if missing_main:
+        raise ValueError(
+            "Для п.21 у часовому профілі відсутні параметри: "
+            + ", ".join(sorted(missing_main))
+        )
+
+    if missing_zone:
+        raise ValueError(
+            "Для п.21 у зональному профілі відсутні параметри: "
+            + ", ".join(sorted(missing_zone))
+        )
+
+    if missing_env:
+        raise ValueError(
+            "Для п.21 у таблиці огороджень відсутні колонки: "
+            + ", ".join(sorted(missing_env))
+        )
+
+    if step_minutes <= 0:
+        raise ValueError(
+            "Крок моделювання має бути більшим за нуль."
+        )
+
+    env = envelope_df.copy()
+
+    env["include"] = (
+        env["include"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    env["area_m2"] = pd.to_numeric(
+        env["area_m2"],
+        errors="coerce",
+    )
+
+    env["u_value_w_m2_k"] = pd.to_numeric(
+        env["u_value_w_m2_k"],
+        errors="coerce",
+    )
+
+    active_env = env["include"]
+
+    if not active_env.any():
+        raise ValueError(
+            "Не вибрано жодного огороджувального елемента."
+        )
+
+    invalid = (
+        active_env
+        & (
+            env["area_m2"].isna()
+            | (env["area_m2"] <= 0)
+            | env["u_value_w_m2_k"].isna()
+            | (env["u_value_w_m2_k"] <= 0)
+        )
+    )
+
+    if invalid.any():
+        bad = (
+            env.loc[invalid, "element"]
+            .astype(str)
+            .tolist()
+        )
+
+        raise ValueError(
+            "Для активних елементів A та U повинні бути "
+            "більшими за нуль: "
+            + ", ".join(bad)
+        )
+
+    env["ua_w_k"] = (
+        env["area_m2"]
+        * env["u_value_w_m2_k"]
+    )
+
+    env.loc[
+        ~env["include"],
+        "ua_w_k",
+    ] = 0.0
+
+    total_area_m2 = float(
+        env.loc[
+            env["include"],
+            "area_m2",
+        ].sum()
+    )
+
+    total_ua_w_k = float(
+        env["ua_w_k"].sum()
+    )
+
+    area_weighted_u = (
+        total_ua_w_k / total_area_m2
+        if total_area_m2 > 0
+        else float("nan")
+    )
+
+    # -------------------------------------------------------------
+    # Representative internal chamber-air temperature by time step.
+    # -------------------------------------------------------------
+    zones = zone_profile.copy()
+
+    zones["air_inlet_temp_c"] = pd.to_numeric(
+        zones["air_inlet_temp_c"],
+        errors="coerce",
+    )
+
+    zones["air_outlet_temp_c"] = pd.to_numeric(
+        zones["air_outlet_temp_c"],
+        errors="coerce",
+    )
+
+    zones["stage21_zone_mean_temp_c"] = (
+        zones["air_inlet_temp_c"]
+        + zones["air_outlet_temp_c"]
+    ) / 2.0
+
+    chamber_temp_by_time = (
+        zones
+        .groupby(
+            "time_position",
+            sort=True,
+        )["stage21_zone_mean_temp_c"]
+        .mean()
+    )
+
+    result = coupled_profile.copy()
+
+    # Preserve the chronological index and add a positional join key.
+    result["time_position"] = range(len(result))
+
+    temp_map = chamber_temp_by_time.to_dict()
+
+    result["heat_loss_chamber_temp_c"] = (
+        result["time_position"].map(temp_map)
+    )
+
+    result["heat_loss_ambient_temp_c"] = pd.to_numeric(
+        result["T2M"],
+        errors="coerce",
+    )
+
+    active = (
+        result["active_drying_command"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    result["heat_loss_delta_t_c"] = (
+        result["heat_loss_chamber_temp_c"]
+        - result["heat_loss_ambient_temp_c"]
+    )
+
+    # Positive values are losses from chamber to ambient.
+    positive_delta_t = (
+        result["heat_loss_delta_t_c"]
+        .clip(lower=0.0)
+    )
+
+    result["heat_loss_power_kw"] = (
+        total_ua_w_k
+        * positive_delta_t
+        / 1000.0
+    ).where(
+        active,
+        0.0,
+    )
+
+    result["heat_loss_power_kw"] = (
+        result["heat_loss_power_kw"]
+        .fillna(0.0)
+    )
+
+    # Diagnostic heat gain if ambient is hotter than chamber.
+    result["heat_gain_equivalent_kw"] = (
+        total_ua_w_k
+        * (
+            -result["heat_loss_delta_t_c"]
+        ).clip(lower=0.0)
+        / 1000.0
+    ).where(
+        active,
+        0.0,
+    ).fillna(0.0)
+
+    dt_h = float(step_minutes) / 60.0
+
+    result["heat_loss_energy_kwh_interval"] = (
+        result["heat_loss_power_kw"]
+        * dt_h
+    )
+
+    result["heat_loss_energy_kwh_cumulative"] = (
+        result["heat_loss_energy_kwh_interval"]
+        .cumsum()
+    )
+
+    positive_losses = result.loc[
+        result["heat_loss_power_kw"] > 0
+    ]
+
+    total_heat_loss_kwh = float(
+        result["heat_loss_energy_kwh_interval"]
+        .sum()
+    )
+
+    peak_heat_loss_kw = (
+        float(
+            positive_losses[
+                "heat_loss_power_kw"
+            ].max()
+        )
+        if not positive_losses.empty
+        else 0.0
+    )
+
+    mean_heat_loss_kw = (
+        float(
+            positive_losses[
+                "heat_loss_power_kw"
+            ].mean()
+        )
+        if not positive_losses.empty
+        else 0.0
+    )
+
+    mean_delta_t_c = (
+        float(
+            positive_losses[
+                "heat_loss_delta_t_c"
+            ].mean()
+        )
+        if not positive_losses.empty
+        else 0.0
+    )
+
+    active_loss_hours = (
+        int(
+            (
+                result["heat_loss_power_kw"] > 0
+            ).sum()
+        )
+        * dt_h
+    )
+
+    total_heat_gain_kwh = float(
+        (
+            result["heat_gain_equivalent_kw"]
+            * dt_h
+        ).sum()
+    )
+
+    # Contribution of each envelope element to total transmission
+    # loss. Because all elements see the same ΔT(t), shares are
+    # proportional to UA.
+    if total_ua_w_k > 0:
+        env["ua_share_pct"] = (
+            env["ua_w_k"]
+            / total_ua_w_k
+            * 100.0
+        )
+    else:
+        env["ua_share_pct"] = 0.0
+
+    env["estimated_loss_energy_kwh"] = (
+        total_heat_loss_kwh
+        * env["ua_share_pct"]
+        / 100.0
+    )
+
+    summary = {
+        "active_envelope_count": int(
+            env.loc[
+                env["include"]
+            ].shape[0]
+        ),
+        "total_envelope_area_m2": (
+            total_area_m2
+        ),
+        "total_ua_w_k": (
+            total_ua_w_k
+        ),
+        "area_weighted_u_w_m2_k": (
+            area_weighted_u
+        ),
+        "total_transmission_heat_loss_kwh": (
+            total_heat_loss_kwh
+        ),
+        "peak_transmission_heat_loss_kw": (
+            peak_heat_loss_kw
+        ),
+        "mean_transmission_heat_loss_kw": (
+            mean_heat_loss_kw
+        ),
+        "mean_loss_delta_t_c": (
+            mean_delta_t_c
+        ),
+        "active_heat_loss_hours": (
+            float(active_loss_hours)
+        ),
+        "total_heat_gain_equivalent_kwh": (
+            total_heat_gain_kwh
+        ),
+    }
+
+    return result, env, summary
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -4157,7 +4531,7 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–20: вихідні дані, масовий баланс, режими, "
+    "Етапи 1–21: вихідні дані, масовий баланс, режими, "
     "погодні дані, психрометрія, геометрія, кінетика Page, "
     "рівноважна вологість та формування системи "
     "тепло- і масообміну сушильної камери."
@@ -4170,7 +4544,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation, tab_product_heating, tab_construction_heating = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation, tab_product_heating, tab_construction_heating, tab_heat_losses = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -4187,6 +4561,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "13. Випаровування вологи",
         "14. Нагрівання продукту",
         "15. Нагрівання конструкцій",
+        "16. Теплові втрати",
     ]
 )
 
@@ -8187,6 +8562,13 @@ with tab_construction_heating:
             "#### Спосіб задання маси елементів"
         )
 
+        st.caption(
+            "У числових полях Streamlit десятковий роздільник вводиться "
+            "крапкою, наприклад 30.50 або 1.03. У цій версії крок "
+            "редагування зменшено, тому значення можна задавати до сотих, "
+            "а для теплоємності — до тисячних."
+        )
+
         construction_mass_mode = st.radio(
             "Оберіть спосіб введення конструкції",
             options=[
@@ -8287,23 +8669,23 @@ with tab_construction_heating:
                     "mass_kg": st.column_config.NumberColumn(
                         "Маса, кг",
                         min_value=0.0,
-                        step=0.1,
+                        step=0.01,
                         format="%.3f",
                     ),
                     "cp_kj_kg_k": st.column_config.NumberColumn(
                         "cₚ, кДж/(кг·К)",
                         min_value=0.0,
-                        step=0.01,
+                        step=0.001,
                         format="%.3f",
                     ),
                     "initial_temp_c": st.column_config.NumberColumn(
                         "T₀, °C",
-                        step=0.5,
+                        step=0.01,
                         format="%.2f",
                     ),
                     "reference_temp_c": st.column_config.NumberColumn(
                         "Tref, °C",
-                        step=0.5,
+                        step=0.01,
                         format="%.2f",
                     ),
                 },
@@ -8456,35 +8838,35 @@ with tab_construction_heating:
                         "area_m2": st.column_config.NumberColumn(
                             "A, м²",
                             min_value=0.0,
-                            step=0.1,
+                            step=0.01,
                             format="%.3f",
                         ),
                         "thickness_mm": st.column_config.NumberColumn(
                             "δ, мм",
                             min_value=0.0,
-                            step=0.5,
+                            step=0.01,
                             format="%.2f",
                         ),
                         "density_kg_m3": st.column_config.NumberColumn(
                             "ρ, кг/м³",
                             min_value=0.0,
-                            step=10.0,
-                            format="%.1f",
+                            step=0.01,
+                            format="%.2f",
                         ),
                         "cp_kj_kg_k": st.column_config.NumberColumn(
                             "cₚ, кДж/(кг·К)",
                             min_value=0.0,
-                            step=0.01,
+                            step=0.001,
                             format="%.3f",
                         ),
                         "initial_temp_c": st.column_config.NumberColumn(
                             "T₀, °C",
-                            step=0.5,
+                            step=0.01,
                             format="%.2f",
                         ),
                         "reference_temp_c": st.column_config.NumberColumn(
                             "Tref, °C",
-                            step=0.5,
+                            step=0.01,
                             format="%.2f",
                         ),
                     },
@@ -8529,27 +8911,29 @@ with tab_construction_heating:
                 )
 
         st.markdown(
-            "#### Тривалість для еквівалентної потужності"
+            "#### Розрахункова тривалість активного сушіння"
         )
 
-        construction_heating_duration_h = st.number_input(
-            "Розрахункова тривалість нагрівання конструкцій, год",
-            min_value=float(model_step_minutes) / 60.0,
-            value=float(
-                max(
-                    float(model_step_minutes) / 60.0,
-                    default_construction_heating_hours,
-                )
-            ),
-            step=0.25,
-            format="%.2f",
-            key="stage20_construction_heating_duration_h",
+        construction_heating_duration_h = float(
+            max(
+                float(model_step_minutes) / 60.0,
+                default_construction_heating_hours,
+            )
+        )
+
+        st.metric(
+            "τсуш із попереднього розрахунку",
+            f"{construction_heating_duration_h:.2f} год",
         )
 
         st.caption(
-            "Цей час використовується тільки для показника "
-            "Q̇екв = Qконстр / τ. Він не задає реальну "
-            "температурну динаміку конструкції."
+            "Це значення автоматично передається з п.16 "
+            "(або, якщо п.16 ще не сформовано, обчислюється з "
+            "фактичних активних інтервалів п.15). "
+            "Воно не є незалежним вхідним параметром і тому "
+            "не редагується. Показник "
+            "Q̇екв = Qконстр / τсуш є лише довідковим; "
+            "він не задає реальну температурну динаміку конструкції."
         )
 
         if components20 is not None:
@@ -8781,11 +9165,436 @@ with tab_construction_heating:
                     key="download_stage20_construction",
                 )
 
-                st.info(
-                    "Наступний етап — пункт 21: розрахунок "
-                    "теплових втрат сушильної камери. "
-                    "Там знадобляться площі огороджень, "
-                    "теплопровідність матеріалів, товщина "
-                    "теплоізоляції та зовнішні умови."
+# ---------------------------------------------------------------------
+# 16. ТЕПЛОВІ ВТРАТИ СУШИЛЬНОЇ КАМЕРИ
+# ---------------------------------------------------------------------
+with tab_heat_losses:
+    st.subheader(
+        "Етап 21. Розрахунок теплових втрат сушильної камери"
+    )
+
+    st.info(
+        "На цьому етапі визначаються трансмісійні теплові "
+        "втрати через огородження сушильної камери під час "
+        "активного сушіння. Втрати з відпрацьованим повітрям "
+        "тут не додаються: вони належать до ентальпійного "
+        "балансу сушильного агента і будуть пов'язані з "
+        "рекуперацією на наступному етапі."
+    )
+
+    st.markdown(
+        "#### Теплопередача через огородження"
+    )
+
+    st.latex(
+        r"\dot Q_{\mathrm{втр}}(t)"
+        r"=\sum_j U_j A_j"
+        r"\left[T_{\mathrm{кам}}(t)-T_{\mathrm{зовн}}(t)\right]"
+    )
+
+    st.write(
+        "Для багатошарової конструкції коефіцієнт теплопередачі "
+        "може бути попередньо визначений через сумарний "
+        "термічний опір:"
+    )
+
+    st.latex(
+        r"U="
+        r"\left("
+        r"R_{\mathrm{si}}"
+        r"+\sum_k\frac{\delta_k}{\lambda_k}"
+        r"+R_{\mathrm{se}}"
+        r"\right)^{-1}"
+    )
+
+    st.caption(
+        "U — коефіцієнт теплопередачі огородження, Вт/(м²·К); "
+        "A — площа огородження; Tкам — репрезентативна "
+        "температура повітря в камері; Tзовн — температура "
+        "зовнішнього повітря."
+    )
+
+    st.warning(
+        "U не задається програмою довільно. Для п.21 потрібно "
+        "ввести розраховане або довідкове значення U для "
+        "реально обраної конструкції. У поточній версії "
+        "не враховуються неконтрольовані витоки повітря через "
+        "нещільності та теплові мости."
+    )
+
+    if "coupled_drying_profile" not in st.session_state:
+        st.warning(
+            "Спочатку виконайте етап 15."
+        )
+
+    elif "coupled_drying_zone_profile" not in st.session_state:
+        st.warning(
+            "Для визначення температури всередині камери "
+            "потрібен зональний профіль з етапу 15."
+        )
+
+    elif "dryer_geometry" not in st.session_state:
+        st.warning(
+            "Спочатку задайте геометрію сушильної камери."
+        )
+
+    else:
+        heatloss21_main = st.session_state[
+            "coupled_drying_profile"
+        ]
+
+        heatloss21_zones = st.session_state[
+            "coupled_drying_zone_profile"
+        ]
+
+        geometry21 = st.session_state[
+            "dryer_geometry"
+        ]
+
+        chamber_l21 = float(
+            geometry21.get(
+                "chamber_length_m",
+                0.0,
+            )
+        )
+
+        chamber_w21 = float(
+            geometry21.get(
+                "chamber_width_m",
+                0.0,
+            )
+        )
+
+        chamber_h21 = float(
+            geometry21.get(
+                "chamber_height_m",
+                0.0,
+            )
+        )
+
+        gross_enclosure_area21 = (
+            2.0
+            * (
+                chamber_l21 * chamber_w21
+                + chamber_l21 * chamber_h21
+                + chamber_w21 * chamber_h21
+            )
+        )
+
+        st.write(
+            "Геометрична площа всіх шести поверхонь камери:"
+        )
+
+        st.metric(
+            "Aогородж",
+            f"{gross_enclosure_area21:.3f} м²",
+        )
+
+        st.caption(
+            "Якщо підлога, двері або окремі поверхні мають "
+            "іншу конструкцію, їх доцільно винести в окремі "
+            "рядки, а площу основного огородження відповідно "
+            "зменшити."
+        )
+
+        if (
+            "stage21_envelope_default"
+            not in st.session_state
+        ):
+            st.session_state[
+                "stage21_envelope_default"
+            ] = pd.DataFrame(
+                [
+                    {
+                        "include": False,
+                        "element": "Основне огородження камери",
+                        "area_m2": gross_enclosure_area21,
+                        "u_value_w_m2_k": 0.0,
+                    },
+                    {
+                        "include": False,
+                        "element": "Двері / люк",
+                        "area_m2": 0.0,
+                        "u_value_w_m2_k": 0.0,
+                    },
+                    {
+                        "include": False,
+                        "element": "Інша ділянка",
+                        "area_m2": 0.0,
+                        "u_value_w_m2_k": 0.0,
+                    },
+                ]
+            )
+
+        st.markdown(
+            "#### Огороджувальні елементи"
+        )
+
+        st.caption(
+            "Увімкніть потрібні рядки та введіть площу A і "
+            "коефіцієнт теплопередачі U. Десятковий роздільник "
+            "у числових полях — крапка."
+        )
+
+        envelope_editor21 = st.data_editor(
+            st.session_state[
+                "stage21_envelope_default"
+            ],
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            key="stage21_envelope_editor",
+            column_config={
+                "include": st.column_config.CheckboxColumn(
+                    "Враховувати",
+                ),
+                "element": st.column_config.TextColumn(
+                    "Огородження",
+                ),
+                "area_m2": st.column_config.NumberColumn(
+                    "A, м²",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.3f",
+                ),
+                "u_value_w_m2_k": st.column_config.NumberColumn(
+                    "U, Вт/(м²·К)",
+                    min_value=0.0,
+                    step=0.001,
+                    format="%.3f",
+                ),
+            },
+        )
+
+        try:
+            (
+                heat_loss_profile21,
+                heat_loss_envelope21,
+                heat_loss_summary21,
+            ) = calculate_transmission_heat_losses_stage21(
+                coupled_profile=heatloss21_main,
+                zone_profile=heatloss21_zones,
+                envelope_df=envelope_editor21,
+                step_minutes=int(model_step_minutes),
+            )
+
+        except Exception as exc:
+            st.warning(str(exc))
+
+        else:
+            st.session_state[
+                "heat_loss_profile"
+            ] = heat_loss_profile21
+
+            st.session_state[
+                "heat_loss_envelope"
+            ] = heat_loss_envelope21
+
+            st.session_state[
+                "heat_loss_summary"
+            ] = heat_loss_summary21
+
+            h1, h2, h3, h4 = st.columns(4)
+
+            h1.metric(
+                "ΣUA",
+                (
+                    f"{heat_loss_summary21['total_ua_w_k']:.2f} "
+                    "Вт/К"
+                ),
+            )
+
+            h2.metric(
+                "Середній U",
+                (
+                    f"{heat_loss_summary21['area_weighted_u_w_m2_k']:.3f} "
+                    "Вт/(м²·К)"
+                ),
+            )
+
+            h3.metric(
+                "Пікові теплові втрати",
+                (
+                    f"{heat_loss_summary21['peak_transmission_heat_loss_kw']:.3f} "
+                    "кВт"
+                ),
+            )
+
+            h4.metric(
+                "Теплова енергія втрат",
+                (
+                    f"{heat_loss_summary21['total_transmission_heat_loss_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            h5, h6, h7 = st.columns(3)
+
+            h5.metric(
+                "Середні теплові втрати",
+                (
+                    f"{heat_loss_summary21['mean_transmission_heat_loss_kw']:.3f} "
+                    "кВт"
+                ),
+            )
+
+            h6.metric(
+                "Середній ΔT",
+                (
+                    f"{heat_loss_summary21['mean_loss_delta_t_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            h7.metric(
+                "Активний час втрат",
+                (
+                    f"{heat_loss_summary21['active_heat_loss_hours']:.2f} "
+                    "год"
+                ),
+            )
+
+            st.success(
+                "Репрезентативна температура камери для п.21 "
+                "не задається вручну: вона автоматично отримується "
+                "з температур входу і виходу зон у п.15."
+            )
+
+            st.markdown(
+                "#### Температурний напір"
+            )
+
+            temp_chart21 = heat_loss_profile21[
+                [
+                    "heat_loss_chamber_temp_c",
+                    "heat_loss_ambient_temp_c",
+                ]
+            ].rename(
+                columns={
+                    "heat_loss_chamber_temp_c": (
+                        "T камери, °C"
+                    ),
+                    "heat_loss_ambient_temp_c": (
+                        "T зовнішнього повітря, °C"
+                    ),
+                }
+            )
+
+            st.line_chart(
+                temp_chart21,
+                width="stretch",
+            )
+
+            st.markdown(
+                "#### Теплова потужність втрат"
+            )
+
+            st.line_chart(
+                heat_loss_profile21[
+                    ["heat_loss_power_kw"]
+                ].rename(
+                    columns={
+                        "heat_loss_power_kw": (
+                            "Q̇втр, кВт"
+                        )
+                    }
+                ),
+                width="stretch",
+            )
+
+            st.markdown(
+                "#### Накопичена теплова енергія втрат"
+            )
+
+            st.line_chart(
+                heat_loss_profile21[
+                    ["heat_loss_energy_kwh_cumulative"]
+                ].rename(
+                    columns={
+                        "heat_loss_energy_kwh_cumulative": (
+                            "Qвтр,Σ, кВт·год"
+                        )
+                    }
+                ),
+                width="stretch",
+            )
+
+            st.markdown(
+                "#### Внесок огороджувальних елементів"
+            )
+
+            st.dataframe(
+                heat_loss_envelope21.loc[
+                    heat_loss_envelope21["include"],
+                    [
+                        "element",
+                        "area_m2",
+                        "u_value_w_m2_k",
+                        "ua_w_k",
+                        "ua_share_pct",
+                        "estimated_loss_energy_kwh",
+                    ],
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
+            if "air_heating_summary" in st.session_state:
+                air_heat21 = float(
+                    st.session_state[
+                        "air_heating_summary"
+                    ][
+                        "total_air_heating_energy_kwh"
+                    ]
                 )
+
+                loss21 = float(
+                    heat_loss_summary21[
+                        "total_transmission_heat_loss_kwh"
+                    ]
+                )
+
+                if air_heat21 > 0:
+                    loss_to_air_heating_pct = (
+                        loss21 / air_heat21 * 100.0
+                    )
+
+                    st.write(
+                        "Трансмісійні втрати становлять "
+                        f"**{loss_to_air_heating_pct:.1f} %** "
+                        "від уже розрахованої енергії на "
+                        "нагрівання сушильного агента у п.17."
+                    )
+
+            st.download_button(
+                "Завантажити часовий ряд теплових втрат",
+                data=dataframe_to_csv_bytes(
+                    heat_loss_profile21
+                ),
+                file_name=(
+                    "stage21_transmission_heat_losses.csv"
+                ),
+                mime="text/csv",
+                width="stretch",
+                key="download_stage21_heat_losses",
+            )
+
+            st.download_button(
+                "Завантажити параметри огороджень",
+                data=dataframe_to_csv_bytes(
+                    heat_loss_envelope21
+                ),
+                file_name=(
+                    "stage21_envelope_parameters.csv"
+                ),
+                mime="text/csv",
+                width="stretch",
+                key="download_stage21_envelope",
+            )
+
+            st.info(
+                "Наступний етап — пункт 22: урахування "
+                "рекуперації теплоти відпрацьованого "
+                "сушильного агента."
+            )
 
