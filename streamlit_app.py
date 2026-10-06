@@ -3861,52 +3861,40 @@ def calculate_product_sensible_heat_stage19(
     return profile, sensitivity, summary
 
 
-def calculate_construction_heating_stage20(
+
+def calculate_construction_thermal_capacity_stage20(
     components_df: pd.DataFrame,
-    heating_duration_h: float,
 ) -> tuple[pd.DataFrame, dict[str, float | int | str]]:
     """
-    Пункт 20. Теплота на нагрівання конструкцій сушильної камери.
+    Пункт 20. Теплова ємність конструкцій сушильної камери.
 
-    Для кожного елемента конструкції:
-        Q_i = m_i * c_p,i * (T_ref,i - T_0,i)
-
-    Сумарно:
-        Q_constr = sum(Q_i)
-
-    Якщо маса елемента визначається за геометрією:
+    Використовуються тільки підтверджувані параметри:
+        m_i, c_p,i
+    або
         m_i = rho_i * A_i * delta_i
 
-    Де:
-    - m_i      — маса елемента, кг;
-    - c_p,i    — питома теплоємність, кДж/(кг·К);
-    - T_0,i    — початкова температура, °C;
-    - T_ref,i  — розрахункова температура нагрівання, °C;
-    - rho_i    — густина матеріалу, кг/м³;
-    - A_i      — площа елемента, м²;
-    - delta_i  — товщина, м.
+    Для кожного елемента:
+        C_i = m_i * c_p,i
 
-    ВАЖЛИВО:
-    Це розрахунок енергії на нагрівання конструкції, а не
-    динамічної температури стінок у часі. Для фактичного Qdot(t)
-    потрібні коефіцієнти тепловіддачі, теплопровідність,
-    багатошарова структура та граничні умови.
+    Сумарна теплова ємність:
+        C_constr = sum(C_i)        [кДж/К]
 
-    heating_duration_h використовується лише для розрахунку
-    еквівалентної середньої потужності:
-        Qdot_eq = Q_constr / tau_heat
+    На цьому етапі НЕ задаються:
+    - T_ref конструкції;
+    - середня температура теплоізоляції;
+    - тривалість нагрівання конструкції;
+    - реальна теплота або потужність нагрівання.
 
-    Вона не є реальною миттєвою тепловою потужністю.
+    Пізніше, після отримання температурної динаміки:
+        dQ_constr = sum(m_i*c_p,i*dT_i)
+        Qdot_constr = sum(m_i*c_p,i*dT_i/dt)
     """
-    import numpy as np
 
     required = {
         "include",
         "component",
         "mass_kg",
         "cp_kj_kg_k",
-        "initial_temp_c",
-        "reference_temp_c",
     }
 
     missing = required - set(components_df.columns)
@@ -3914,11 +3902,6 @@ def calculate_construction_heating_stage20(
         raise ValueError(
             "Для етапу 20 відсутні колонки: "
             + ", ".join(sorted(missing))
-        )
-
-    if heating_duration_h <= 0:
-        raise ValueError(
-            "Тривалість нагрівання має бути більшою за нуль."
         )
 
     result = components_df.copy()
@@ -3929,59 +3912,33 @@ def calculate_construction_heating_stage20(
         .astype(bool)
     )
 
-    numeric_cols = [
-        "mass_kg",
-        "cp_kj_kg_k",
-        "initial_temp_c",
-        "reference_temp_c",
-    ]
+    result["mass_kg"] = pd.to_numeric(
+        result["mass_kg"],
+        errors="coerce",
+    )
 
-    for col in numeric_cols:
-        result[col] = pd.to_numeric(
-            result[col],
-            errors="coerce",
-        )
+    result["cp_kj_kg_k"] = pd.to_numeric(
+        result["cp_kj_kg_k"],
+        errors="coerce",
+    )
 
-    active = result["include"].copy()
+    active = result["include"]
 
     if not active.any():
         raise ValueError(
             "Не вибрано жодного елемента конструкції. "
-            "Увімкніть хоча б один рядок у колонці «Враховувати»."
+            "Увімкніть тільки ті елементи, для яких уже "
+            "підтверджені маса/геометрія та cₚ матеріалу."
         )
 
-    invalid_mass = (
+    invalid = (
         active
         & (
             result["mass_kg"].isna()
             | (result["mass_kg"] <= 0)
-        )
-    )
-
-    invalid_cp = (
-        active
-        & (
-            result["cp_kj_kg_k"].isna()
+            | result["cp_kj_kg_k"].isna()
             | (result["cp_kj_kg_k"] <= 0)
         )
-    )
-
-    invalid_temp = (
-        active
-        & (
-            result["initial_temp_c"].isna()
-            | result["reference_temp_c"].isna()
-            | (
-                result["reference_temp_c"]
-                < result["initial_temp_c"]
-            )
-        )
-    )
-
-    invalid = (
-        invalid_mass
-        | invalid_cp
-        | invalid_temp
     )
 
     if invalid.any():
@@ -3992,39 +3949,23 @@ def calculate_construction_heating_stage20(
         )
 
         raise ValueError(
-            "Перевірте масу, теплоємність і температури "
-            "для елементів: "
+            "Для активних елементів повинні бути "
+            "підтверджені m > 0 та cₚ > 0: "
             + ", ".join(bad_names)
-            + ". Для нагрівання потрібно "
-            "m>0, cp>0 та T_ref>=T_0."
         )
-
-    result["delta_t_c"] = (
-        result["reference_temp_c"]
-        - result["initial_temp_c"]
-    )
 
     result["thermal_capacity_kj_k"] = (
         result["mass_kg"]
         * result["cp_kj_kg_k"]
     )
 
-    result["construction_heat_kj"] = (
-        result["thermal_capacity_kj_k"]
-        * result["delta_t_c"]
-    )
-
-    # Rows not selected are excluded from the total.
     result.loc[
         ~result["include"],
-        [
-            "thermal_capacity_kj_k",
-            "construction_heat_kj",
-        ],
+        "thermal_capacity_kj_k",
     ] = 0.0
 
-    result["construction_heat_kwh"] = (
-        result["construction_heat_kj"]
+    result["energy_per_1k_kwh"] = (
+        result["thermal_capacity_kj_k"]
         / 3600.0
     )
 
@@ -4039,61 +3980,28 @@ def calculate_construction_heating_stage20(
         result["thermal_capacity_kj_k"].sum()
     )
 
-    total_heat_kj = float(
-        result["construction_heat_kj"].sum()
-    )
-
-    total_heat_kwh = (
-        total_heat_kj / 3600.0
-    )
-
-    equivalent_mean_power_kw = (
-        total_heat_kwh
-        / float(heating_duration_h)
+    energy_per_1k_kwh = (
+        total_capacity_kj_k / 3600.0
     )
 
     active_result = result.loc[
         result["include"]
     ].copy()
 
-    if total_heat_kwh > 0:
-        active_result["heat_share_pct"] = (
-            active_result["construction_heat_kwh"]
-            / total_heat_kwh
+    if total_capacity_kj_k > 0:
+        active_result["capacity_share_pct"] = (
+            active_result["thermal_capacity_kj_k"]
+            / total_capacity_kj_k
             * 100.0
         )
     else:
-        active_result["heat_share_pct"] = 0.0
+        active_result["capacity_share_pct"] = 0.0
 
-    result["heat_share_pct"] = 0.0
+    result["capacity_share_pct"] = 0.0
     result.loc[
         active_result.index,
-        "heat_share_pct",
-    ] = active_result["heat_share_pct"]
-
-    if not active_result.empty:
-        dominant_idx = (
-            active_result[
-                "construction_heat_kwh"
-            ].idxmax()
-        )
-
-        dominant_component = str(
-            active_result.loc[
-                dominant_idx,
-                "component",
-            ]
-        )
-
-        dominant_share_pct = float(
-            active_result.loc[
-                dominant_idx,
-                "heat_share_pct",
-            ]
-        )
-    else:
-        dominant_component = "—"
-        dominant_share_pct = 0.0
+        "capacity_share_pct",
+    ] = active_result["capacity_share_pct"]
 
     weighted_cp_kj_kg_k = (
         float(
@@ -4107,37 +4015,38 @@ def calculate_construction_heating_stage20(
         else float("nan")
     )
 
+    dominant_component = "—"
+    dominant_share_pct = 0.0
+
+    if not active_result.empty:
+        dominant_idx = (
+            active_result[
+                "thermal_capacity_kj_k"
+            ].idxmax()
+        )
+        dominant_component = str(
+            active_result.loc[
+                dominant_idx,
+                "component",
+            ]
+        )
+        dominant_share_pct = float(
+            active_result.loc[
+                dominant_idx,
+                "capacity_share_pct",
+            ]
+        )
+
     summary = {
         "active_component_count": int(
             active_result.shape[0]
         ),
-        "total_construction_mass_kg": (
-            total_mass_kg
-        ),
-        "total_thermal_capacity_kj_k": (
-            total_capacity_kj_k
-        ),
-        "total_construction_heating_kj": (
-            total_heat_kj
-        ),
-        "total_construction_heating_kwh": (
-            total_heat_kwh
-        ),
-        "heating_duration_h": (
-            float(heating_duration_h)
-        ),
-        "equivalent_mean_power_kw": (
-            equivalent_mean_power_kw
-        ),
-        "weighted_cp_kj_kg_k": (
-            weighted_cp_kj_kg_k
-        ),
-        "dominant_component": (
-            dominant_component
-        ),
-        "dominant_share_pct": (
-            dominant_share_pct
-        ),
+        "total_construction_mass_kg": total_mass_kg,
+        "total_thermal_capacity_kj_k": total_capacity_kj_k,
+        "energy_per_1k_kwh": energy_per_1k_kwh,
+        "weighted_cp_kj_kg_k": weighted_cp_kj_kg_k,
+        "dominant_component": dominant_component,
+        "dominant_share_pct": dominant_share_pct,
     }
 
     return result, summary
@@ -4560,7 +4469,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "12. Нагрівання сушильного агента",
         "13. Випаровування вологи",
         "14. Нагрівання продукту",
-        "15. Нагрівання конструкцій",
+        "15. Теплова ємність конструкцій",
         "16. Теплові втрати",
     ]
 )
@@ -8453,224 +8362,289 @@ with tab_product_heating:
             )
 
 # ---------------------------------------------------------------------
-# 15. НАГРІВАННЯ КОНСТРУКЦІЙ СУШИЛЬНОЇ КАМЕРИ
+# 15. ТЕПЛОВА ЄМНІСТЬ КОНСТРУКЦІЙ СУШИЛЬНОЇ КАМЕРИ
 # ---------------------------------------------------------------------
 with tab_construction_heating:
     st.subheader(
-        "Етап 20. Розрахунок теплоти на нагрівання конструкцій"
+        "Етап 20. Визначення теплової ємності конструкцій"
     )
 
     st.info(
-        "На цьому етапі визначається енергія, необхідна для "
-        "нагрівання матеріалів сушильної камери: корпусу, "
-        "лотків, рами, дверей та інших елементів. "
-        "Матеріали конструкції ще не зафіксовані, тому код "
-        "навмисно не підставляє довільні густини або теплоємності. "
-        "Їх потрібно ввести за реально обраними матеріалами "
-        "або технічними даними."
+        "У п.20 використовуються лише параметри, які можна "
+        "підтвердити за геометрією конструкції, специфікацією "
+        "або довідковими властивостями реально обраного матеріалу. "
+        "Невідома температура конструкції не задається."
     )
 
-    st.markdown(
-        "#### Основна залежність"
-    )
-
-    st.latex(
-        r"Q_{\mathrm{констр}}"
-        r"=\sum_i m_i c_{p,i}"
-        r"\left(T_{\mathrm{ref},i}-T_{0,i}\right)"
-    )
-
-    st.write(
-        "Якщо маса елемента визначається через його геометрію:"
-    )
+    st.markdown("#### Розрахункова постановка")
 
     st.latex(
         r"m_i=\rho_i A_i\delta_i"
     )
 
+    st.latex(
+        r"C_i=m_i c_{p,i}"
+    )
+
+    st.latex(
+        r"C_{\mathrm{констр}}"
+        r"=\sum_i m_i c_{p,i}"
+    )
+
     st.caption(
-        "Qконстр — теплота на нагрівання конструкцій; "
-        "mᵢ — маса елемента; cₚ,ᵢ — питома теплоємність; "
-        "T₀,ᵢ — початкова температура; "
-        "Tref,ᵢ — розрахункова температура нагрівання."
+        "Cконстр — сумарна теплова ємність конструкції, кДж/К. "
+        "Вона показує, скільки теплоти потрібно для підвищення "
+        "температури врахованих конструктивних елементів на 1 К."
     )
 
     st.warning(
-        "Розрахунок у п.20 визначає саме енергію на нагрівання "
-        "конструкцій. Реальна температура стінок Tконстр(t) та "
-        "миттєва теплова потужність потребують окремої "
-        "нестаціонарної моделі теплообміну і на цьому етапі "
-        "не задаються штучно."
+        "Фактична теплота на нагрівання Qконстр і потужність "
+        "Q̇констр на цьому етапі не визначаються, оскільки ще "
+        "немає розрахованої температури конструкції Tконстр(t). "
+        "Після формування нестаціонарного енергетичного балансу "
+        "буде використано dQконстр = Σ(mᵢcₚ,ᵢdTᵢ)."
     )
 
-    if "coupled_drying_profile" not in st.session_state:
-        st.warning(
-            "Спочатку виконайте етап 15, щоб отримати "
-            "початкові температурні умови."
-        )
-    else:
-        construction20_profile = st.session_state[
-            "coupled_drying_profile"
-        ]
+    st.markdown(
+        "#### Спосіб задання конструктивних параметрів"
+    )
 
-        # -------------------------------------------------------------
-        # Default initial temperature: ambient temperature at process start
-        # -------------------------------------------------------------
+    st.caption(
+        "Десятковий роздільник у числових полях Streamlit — крапка. "
+        "Не вмикайте рядок, доки відповідні параметри не підтверджені."
+    )
+
+    construction_mass_mode = st.radio(
+        "Оберіть спосіб визначення маси елементів",
+        options=[
+            "Ввести фактичну масу елементів",
+            "Розрахувати масу за геометрією і густиною",
+        ],
+        index=0,
+        key="stage20_construction_mass_mode_v2",
+    )
+
+    components20 = None
+
+    if construction_mass_mode == "Ввести фактичну масу елементів":
+
         if (
-            "T2M" in construction20_profile.columns
-            and pd.notna(
-                pd.to_numeric(
-                    construction20_profile["T2M"],
-                    errors="coerce",
-                ).iloc[0]
-            )
+            "stage20_direct_components_verified_default"
+            not in st.session_state
         ):
-            default_construction_t0 = float(
-                pd.to_numeric(
-                    construction20_profile["T2M"],
-                    errors="coerce",
-                ).iloc[0]
+            st.session_state[
+                "stage20_direct_components_verified_default"
+            ] = pd.DataFrame(
+                [
+                    {
+                        "include": False,
+                        "component": "Корпус / стінки",
+                        "mass_kg": 0.0,
+                        "cp_kj_kg_k": 0.0,
+                        "source_note": "",
+                    },
+                    {
+                        "include": False,
+                        "component": "Лотки",
+                        "mass_kg": 0.0,
+                        "cp_kj_kg_k": 0.0,
+                        "source_note": "",
+                    },
+                    {
+                        "include": False,
+                        "component": "Рама / опори",
+                        "mass_kg": 0.0,
+                        "cp_kj_kg_k": 0.0,
+                        "source_note": "",
+                    },
+                    {
+                        "include": False,
+                        "component": "Двері / інші елементи",
+                        "mass_kg": 0.0,
+                        "cp_kj_kg_k": 0.0,
+                        "source_note": "",
+                    },
+                ]
             )
-        else:
-            default_construction_t0 = 20.0
 
-        default_construction_tref = float(
-            product["target_drying_temp_c"]
+        st.write(
+            "Цей режим використовується, якщо фактична маса "
+            "елемента відома зі специфікації, креслення або зважування."
         )
 
-        if "drying_performance_summary" in st.session_state:
-            default_construction_heating_hours = float(
-                st.session_state[
-                    "drying_performance_summary"
-                ]["actual_active_hours"]
-            )
-        else:
-            default_construction_heating_hours = max(
-                float(model_step_minutes) / 60.0,
-                float(
-                    (
-                        construction20_profile[
-                            "actual_water_removed_interval_kg"
-                        ] > 0
-                    ).sum()
-                )
-                * float(model_step_minutes)
-                / 60.0,
-            )
-
-        st.markdown(
-            "#### Спосіб задання маси елементів"
-        )
-
-        st.caption(
-            "У числових полях Streamlit десятковий роздільник вводиться "
-            "крапкою, наприклад 30.50 або 1.03. У цій версії крок "
-            "редагування зменшено, тому значення можна задавати до сотих, "
-            "а для теплоємності — до тисячних."
-        )
-
-        construction_mass_mode = st.radio(
-            "Оберіть спосіб введення конструкції",
-            options=[
-                "Ввести масу елементів безпосередньо",
-                "Розрахувати масу за площею, товщиною і густиною",
+        construction_editor = st.data_editor(
+            st.session_state[
+                "stage20_direct_components_verified_default"
             ],
-            index=0,
-            key="stage20_construction_mass_mode",
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            key="stage20_direct_components_editor_v2",
+            column_config={
+                "include": st.column_config.CheckboxColumn(
+                    "Враховувати",
+                ),
+                "component": st.column_config.TextColumn(
+                    "Елемент",
+                ),
+                "mass_kg": st.column_config.NumberColumn(
+                    "m, кг",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.3f",
+                ),
+                "cp_kj_kg_k": st.column_config.NumberColumn(
+                    "cₚ, кДж/(кг·К)",
+                    min_value=0.0,
+                    step=0.001,
+                    format="%.3f",
+                ),
+                "source_note": st.column_config.TextColumn(
+                    "Джерело / примітка",
+                ),
+            },
         )
 
-        # -------------------------------------------------------------
-        # Direct mass mode
-        # -------------------------------------------------------------
-        if (
-            construction_mass_mode
-            == "Ввести масу елементів безпосередньо"
-        ):
+        components20 = construction_editor.copy()
+
+    else:
+        if "dryer_geometry" not in st.session_state:
+            st.warning(
+                "Для цього режиму спочатку задайте геометрію "
+                "сушильної камери у вкладці 6."
+            )
+
+        else:
+            geometry20 = st.session_state["dryer_geometry"]
+
+            chamber_l20 = float(
+                geometry20.get("chamber_length_m", 0.0)
+            )
+            chamber_w20 = float(
+                geometry20.get("chamber_width_m", 0.0)
+            )
+            chamber_h20 = float(
+                geometry20.get("chamber_height_m", 0.0)
+            )
+
+            enclosure_area20 = (
+                2.0
+                * (
+                    chamber_l20 * chamber_w20
+                    + chamber_l20 * chamber_h20
+                    + chamber_w20 * chamber_h20
+                )
+            )
+
+            trays_area20 = float(
+                geometry20.get(
+                    "total_drying_area_m2",
+                    0.0,
+                )
+            )
+
+            st.write(
+                "Із уже заданої геометрії отримано:"
+            )
+
+            g1, g2 = st.columns(2)
+
+            g1.metric(
+                "Геометрична площа 6 поверхонь камери",
+                f"{enclosure_area20:.3f} м²",
+            )
+
+            g2.metric(
+                "Сумарна площа сушильних лотків",
+                f"{trays_area20:.3f} м²",
+            )
+
+            st.caption(
+                "Ці площі є результатом попередньо заданої геометрії. "
+                "Якщо реальна площа матеріалу відрізняється через "
+                "перфорацію, отвори, двері або неповне покриття, "
+                "введіть фактичну площу."
+            )
+
             if (
-                "stage20_direct_components_default"
+                "stage20_geometry_components_verified_default"
                 not in st.session_state
             ):
                 st.session_state[
-                    "stage20_direct_components_default"
+                    "stage20_geometry_components_verified_default"
                 ] = pd.DataFrame(
                     [
                         {
                             "include": False,
-                            "component": "Корпус / стінки",
-                            "mass_kg": 0.0,
+                            "component": "Корпус — матеріальний шар",
+                            "area_m2": enclosure_area20,
+                            "thickness_mm": 0.0,
+                            "density_kg_m3": 0.0,
                             "cp_kj_kg_k": 0.0,
-                            "initial_temp_c": (
-                                default_construction_t0
-                            ),
-                            "reference_temp_c": (
-                                default_construction_tref
-                            ),
+                            "source_note": "",
+                        },
+                        {
+                            "include": False,
+                            "component": "Теплоізоляція",
+                            "area_m2": enclosure_area20,
+                            "thickness_mm": 0.0,
+                            "density_kg_m3": 0.0,
+                            "cp_kj_kg_k": 0.0,
+                            "source_note": "",
                         },
                         {
                             "include": False,
                             "component": "Лотки",
-                            "mass_kg": 0.0,
+                            "area_m2": trays_area20,
+                            "thickness_mm": 0.0,
+                            "density_kg_m3": 0.0,
                             "cp_kj_kg_k": 0.0,
-                            "initial_temp_c": (
-                                default_construction_t0
-                            ),
-                            "reference_temp_c": (
-                                default_construction_tref
-                            ),
+                            "source_note": "",
                         },
                         {
                             "include": False,
-                            "component": "Рама / опори",
-                            "mass_kg": 0.0,
+                            "component": "Рама / інше",
+                            "area_m2": 0.0,
+                            "thickness_mm": 0.0,
+                            "density_kg_m3": 0.0,
                             "cp_kj_kg_k": 0.0,
-                            "initial_temp_c": (
-                                default_construction_t0
-                            ),
-                            "reference_temp_c": (
-                                default_construction_tref
-                            ),
-                        },
-                        {
-                            "include": False,
-                            "component": "Двері / внутрішні елементи",
-                            "mass_kg": 0.0,
-                            "cp_kj_kg_k": 0.0,
-                            "initial_temp_c": (
-                                default_construction_t0
-                            ),
-                            "reference_temp_c": (
-                                default_construction_tref
-                            ),
+                            "source_note": "",
                         },
                     ]
                 )
 
-            st.caption(
-                "Увімкніть потрібні рядки та введіть фактичну "
-                "масу і питому теплоємність матеріалу. "
-                "Можна додавати власні рядки."
-            )
-
-            construction_editor = st.data_editor(
+            geometry_editor20 = st.data_editor(
                 st.session_state[
-                    "stage20_direct_components_default"
+                    "stage20_geometry_components_verified_default"
                 ],
                 num_rows="dynamic",
                 width="stretch",
                 hide_index=True,
-                key="stage20_direct_components_editor",
+                key="stage20_geometry_components_editor_v2",
                 column_config={
                     "include": st.column_config.CheckboxColumn(
                         "Враховувати",
                     ),
                     "component": st.column_config.TextColumn(
-                        "Елемент",
+                        "Елемент / матеріал",
                     ),
-                    "mass_kg": st.column_config.NumberColumn(
-                        "Маса, кг",
+                    "area_m2": st.column_config.NumberColumn(
+                        "A, м²",
                         min_value=0.0,
                         step=0.01,
                         format="%.3f",
+                    ),
+                    "thickness_mm": st.column_config.NumberColumn(
+                        "δ, мм",
+                        min_value=0.0,
+                        step=0.01,
+                        format="%.2f",
+                    ),
+                    "density_kg_m3": st.column_config.NumberColumn(
+                        "ρ, кг/м³",
+                        min_value=0.0,
+                        step=0.01,
+                        format="%.2f",
                     ),
                     "cp_kj_kg_k": st.column_config.NumberColumn(
                         "cₚ, кДж/(кг·К)",
@@ -8678,492 +8652,180 @@ with tab_construction_heating:
                         step=0.001,
                         format="%.3f",
                     ),
-                    "initial_temp_c": st.column_config.NumberColumn(
-                        "T₀, °C",
-                        step=0.01,
-                        format="%.2f",
-                    ),
-                    "reference_temp_c": st.column_config.NumberColumn(
-                        "Tref, °C",
-                        step=0.01,
-                        format="%.2f",
+                    "source_note": st.column_config.TextColumn(
+                        "Джерело / примітка",
                     ),
                 },
             )
 
-            components20 = construction_editor.copy()
+            components20 = geometry_editor20.copy()
 
-        # -------------------------------------------------------------
-        # Geometry-based mode
-        # -------------------------------------------------------------
-        else:
-            if "dryer_geometry" not in st.session_state:
-                st.warning(
-                    "Для геометричного способу спочатку задайте "
-                    "геометрію сушильної камери у вкладці 6."
-                )
-                components20 = None
-
-            else:
-                geometry20 = st.session_state[
-                    "dryer_geometry"
-                ]
-
-                chamber_l20 = float(
-                    geometry20.get(
-                        "chamber_length_m",
-                        0.0,
-                    )
-                )
-
-                chamber_w20 = float(
-                    geometry20.get(
-                        "chamber_width_m",
-                        0.0,
-                    )
-                )
-
-                chamber_h20 = float(
-                    geometry20.get(
-                        "chamber_height_m",
-                        0.0,
-                    )
-                )
-
-                enclosure_area20 = (
-                    2.0
-                    * (
-                        chamber_l20 * chamber_w20
-                        + chamber_l20 * chamber_h20
-                        + chamber_w20 * chamber_h20
-                    )
-                )
-
-                trays_area20 = float(
-                    geometry20.get(
-                        "total_drying_area_m2",
-                        0.0,
-                    )
-                )
-
-                if (
-                    "stage20_geometry_components_default"
-                    not in st.session_state
-                ):
-                    st.session_state[
-                        "stage20_geometry_components_default"
-                    ] = pd.DataFrame(
-                        [
-                            {
-                                "include": False,
-                                "component": "Корпус — шар 1",
-                                "area_m2": enclosure_area20,
-                                "thickness_mm": 0.0,
-                                "density_kg_m3": 0.0,
-                                "cp_kj_kg_k": 0.0,
-                                "initial_temp_c": (
-                                    default_construction_t0
-                                ),
-                                "reference_temp_c": (
-                                    default_construction_tref
-                                ),
-                            },
-                            {
-                                "include": False,
-                                "component": "Корпус — шар 2",
-                                "area_m2": enclosure_area20,
-                                "thickness_mm": 0.0,
-                                "density_kg_m3": 0.0,
-                                "cp_kj_kg_k": 0.0,
-                                "initial_temp_c": (
-                                    default_construction_t0
-                                ),
-                                "reference_temp_c": (
-                                    default_construction_tref
-                                ),
-                            },
-                            {
-                                "include": False,
-                                "component": "Лотки",
-                                "area_m2": trays_area20,
-                                "thickness_mm": 0.0,
-                                "density_kg_m3": 0.0,
-                                "cp_kj_kg_k": 0.0,
-                                "initial_temp_c": (
-                                    default_construction_t0
-                                ),
-                                "reference_temp_c": (
-                                    default_construction_tref
-                                ),
-                            },
-                            {
-                                "include": False,
-                                "component": "Рама / інше",
-                                "area_m2": 0.0,
-                                "thickness_mm": 0.0,
-                                "density_kg_m3": 0.0,
-                                "cp_kj_kg_k": 0.0,
-                                "initial_temp_c": (
-                                    default_construction_t0
-                                ),
-                                "reference_temp_c": (
-                                    default_construction_tref
-                                ),
-                            },
-                        ]
-                    )
-
-                st.caption(
-                    "Для багатошарової стінки кожен матеріальний "
-                    "шар задається окремим рядком. Площа корпусу "
-                    "попередньо взята з геометрії камери, але її "
-                    "можна змінити."
-                )
-
-                geometry_editor20 = st.data_editor(
-                    st.session_state[
-                        "stage20_geometry_components_default"
-                    ],
-                    num_rows="dynamic",
-                    width="stretch",
-                    hide_index=True,
-                    key="stage20_geometry_components_editor",
-                    column_config={
-                        "include": st.column_config.CheckboxColumn(
-                            "Враховувати",
-                        ),
-                        "component": st.column_config.TextColumn(
-                            "Елемент / шар",
-                        ),
-                        "area_m2": st.column_config.NumberColumn(
-                            "A, м²",
-                            min_value=0.0,
-                            step=0.01,
-                            format="%.3f",
-                        ),
-                        "thickness_mm": st.column_config.NumberColumn(
-                            "δ, мм",
-                            min_value=0.0,
-                            step=0.01,
-                            format="%.2f",
-                        ),
-                        "density_kg_m3": st.column_config.NumberColumn(
-                            "ρ, кг/м³",
-                            min_value=0.0,
-                            step=0.01,
-                            format="%.2f",
-                        ),
-                        "cp_kj_kg_k": st.column_config.NumberColumn(
-                            "cₚ, кДж/(кг·К)",
-                            min_value=0.0,
-                            step=0.001,
-                            format="%.3f",
-                        ),
-                        "initial_temp_c": st.column_config.NumberColumn(
-                            "T₀, °C",
-                            step=0.01,
-                            format="%.2f",
-                        ),
-                        "reference_temp_c": st.column_config.NumberColumn(
-                            "Tref, °C",
-                            step=0.01,
-                            format="%.2f",
-                        ),
-                    },
-                )
-
-                components20 = geometry_editor20.copy()
-
-                components20["mass_kg"] = (
+            components20["mass_kg"] = (
+                pd.to_numeric(
+                    components20["area_m2"],
+                    errors="coerce",
+                ).fillna(0.0)
+                * (
                     pd.to_numeric(
-                        components20["area_m2"],
+                        components20["thickness_mm"],
                         errors="coerce",
                     ).fillna(0.0)
-                    * (
-                        pd.to_numeric(
-                            components20["thickness_mm"],
-                            errors="coerce",
-                        ).fillna(0.0)
-                        / 1000.0
-                    )
-                    * pd.to_numeric(
-                        components20["density_kg_m3"],
-                        errors="coerce",
-                    ).fillna(0.0)
+                    / 1000.0
                 )
+                * pd.to_numeric(
+                    components20["density_kg_m3"],
+                    errors="coerce",
+                ).fillna(0.0)
+            )
 
-                st.write(
-                    "Розрахована маса активних елементів:"
-                )
+            st.write(
+                "Маса, отримана лише з введених параметрів:"
+            )
 
-                preview20 = components20[
+            st.dataframe(
+                components20[
                     [
                         "include",
                         "component",
                         "mass_kg",
+                        "source_note",
                     ]
-                ].copy()
-
-                st.dataframe(
-                    preview20,
-                    width="stretch",
-                    hide_index=True,
-                )
-
-        st.markdown(
-            "#### Розрахункова тривалість активного сушіння"
-        )
-
-        construction_heating_duration_h = float(
-            max(
-                float(model_step_minutes) / 60.0,
-                default_construction_heating_hours,
+                ],
+                width="stretch",
+                hide_index=True,
             )
-        )
 
-        st.metric(
-            "τсуш із попереднього розрахунку",
-            f"{construction_heating_duration_h:.2f} год",
-        )
+    if components20 is not None:
+        try:
+            (
+                construction_result20,
+                construction_summary20,
+            ) = calculate_construction_thermal_capacity_stage20(
+                components_df=components20,
+            )
 
-        st.caption(
-            "Це значення автоматично передається з п.16 "
-            "(або, якщо п.16 ще не сформовано, обчислюється з "
-            "фактичних активних інтервалів п.15). "
-            "Воно не є незалежним вхідним параметром і тому "
-            "не редагується. Показник "
-            "Q̇екв = Qконстр / τсуш є лише довідковим; "
-            "він не задає реальну температурну динаміку конструкції."
-        )
+        except Exception as exc:
+            st.warning(str(exc))
 
-        if components20 is not None:
-            try:
+        else:
+            st.session_state[
+                "construction_thermal_capacity_components"
+            ] = construction_result20
+
+            st.session_state[
+                "construction_thermal_capacity_summary"
+            ] = construction_summary20
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            c1.metric(
+                "Маса врахованих конструкцій",
                 (
-                    construction_result20,
-                    construction_summary20,
-                ) = calculate_construction_heating_stage20(
-                    components_df=components20,
-                    heating_duration_h=float(
-                        construction_heating_duration_h
-                    ),
-                )
-            except Exception as exc:
-                st.warning(str(exc))
-            else:
-                st.session_state[
-                    "construction_heating_components"
-                ] = construction_result20
+                    f"{construction_summary20['total_construction_mass_kg']:.2f} "
+                    "кг"
+                ),
+            )
 
-                st.session_state[
-                    "construction_heating_summary"
-                ] = construction_summary20
+            c2.metric(
+                "Σmcₚ",
+                (
+                    f"{construction_summary20['total_thermal_capacity_kj_k']:.2f} "
+                    "кДж/К"
+                ),
+            )
 
-                c1, c2, c3, c4 = st.columns(4)
+            c3.metric(
+                "На підвищення температури на 1 К",
+                (
+                    f"{construction_summary20['energy_per_1k_kwh']:.4f} "
+                    "кВт·год/К"
+                ),
+            )
 
-                c1.metric(
-                    "Маса конструкцій",
-                    (
-                        f"{construction_summary20['total_construction_mass_kg']:.2f} "
-                        "кг"
-                    ),
-                )
+            c4.metric(
+                "Середньозважене cₚ",
+                (
+                    f"{construction_summary20['weighted_cp_kj_kg_k']:.3f} "
+                    "кДж/(кг·К)"
+                ),
+            )
 
-                c2.metric(
-                    "Теплова ємність Σmcₚ",
-                    (
-                        f"{construction_summary20['total_thermal_capacity_kj_k']:.2f} "
-                        "кДж/К"
-                    ),
-                )
+            st.write(
+                "Найбільший внесок у теплову ємність: "
+                f"**{construction_summary20['dominant_component']}** "
+                f"({construction_summary20['dominant_share_pct']:.1f} %)."
+            )
 
-                c3.metric(
-                    "Теплота на нагрівання",
-                    (
-                        f"{construction_summary20['total_construction_heating_kwh']:.3f} "
-                        "кВт·год"
-                    ),
-                )
+            st.markdown(
+                "#### Внесок елементів у теплову ємність"
+            )
 
-                c4.metric(
-                    "Еквівалентна середня потужність",
-                    (
-                        f"{construction_summary20['equivalent_mean_power_kw']:.3f} "
-                        "кВт"
-                    ),
-                )
-
-                st.write(
-                    "Найбільший внесок у нагрівання: "
-                    f"**{construction_summary20['dominant_component']}** "
-                    f"({construction_summary20['dominant_share_pct']:.1f} %)."
-                )
-
-                st.markdown(
-                    "#### Внесок елементів конструкції"
-                )
-
-                construction_chart20 = (
-                    construction_result20.loc[
-                        construction_result20["include"],
-                        [
-                            "component",
-                            "construction_heat_kwh",
-                        ],
-                    ]
-                    .set_index("component")
-                    .rename(
-                        columns={
-                            "construction_heat_kwh": (
-                                "Q конструкції, кВт·год"
-                            )
-                        }
-                    )
-                )
-
-                st.bar_chart(
-                    construction_chart20,
-                    width="stretch",
-                )
-
-                st.markdown(
-                    "#### Деталізація розрахунку"
-                )
-
-                display_cols20 = [
-                    "component",
-                    "mass_kg",
-                    "cp_kj_kg_k",
-                    "initial_temp_c",
-                    "reference_temp_c",
-                    "delta_t_c",
-                    "thermal_capacity_kj_k",
-                    "construction_heat_kwh",
-                    "heat_share_pct",
-                ]
-
-                existing_cols20 = [
-                    col
-                    for col in display_cols20
-                    if col in construction_result20.columns
-                ]
-
-                st.dataframe(
-                    construction_result20.loc[
-                        construction_result20["include"],
-                        existing_cols20,
+            capacity_chart20 = (
+                construction_result20.loc[
+                    construction_result20["include"],
+                    [
+                        "component",
+                        "thermal_capacity_kj_k",
                     ],
-                    width="stretch",
-                    hide_index=True,
-                )
-
-                # -----------------------------------------------------
-                # Comparison with already calculated energy components
-                # -----------------------------------------------------
-                comparison_rows20 = []
-
-                if (
-                    "air_heating_summary"
-                    in st.session_state
-                ):
-                    comparison_rows20.append(
-                        {
-                            "Складова": (
-                                "Нагрівання сушильного агента"
-                            ),
-                            "Енергія, кВт·год": float(
-                                st.session_state[
-                                    "air_heating_summary"
-                                ][
-                                    "total_air_heating_energy_kwh"
-                                ]
-                            ),
-                        }
-                    )
-
-                if (
-                    "evaporation_energy_summary"
-                    in st.session_state
-                ):
-                    comparison_rows20.append(
-                        {
-                            "Складова": (
-                                "Фазовий перехід води"
-                            ),
-                            "Енергія, кВт·год": float(
-                                st.session_state[
-                                    "evaporation_energy_summary"
-                                ][
-                                    "total_evaporation_energy_kwh"
-                                ]
-                            ),
-                        }
-                    )
-
-                if (
-                    "product_heating_summary"
-                    in st.session_state
-                ):
-                    comparison_rows20.append(
-                        {
-                            "Складова": (
-                                "Нагрівання продукту"
-                            ),
-                            "Енергія, кВт·год": float(
-                                st.session_state[
-                                    "product_heating_summary"
-                                ][
-                                    "total_initial_product_sensible_heat_kwh"
-                                ]
-                            ),
-                        }
-                    )
-
-                comparison_rows20.append(
-                    {
-                        "Складова": (
-                            "Нагрівання конструкцій"
-                        ),
-                        "Енергія, кВт·год": float(
-                            construction_summary20[
-                                "total_construction_heating_kwh"
-                            ]
-                        ),
+                ]
+                .set_index("component")
+                .rename(
+                    columns={
+                        "thermal_capacity_kj_k": "Cᵢ, кДж/К"
                     }
                 )
+            )
 
-                if len(comparison_rows20) > 1:
-                    st.markdown(
-                        "#### Порівняння вже визначених енергетичних складових"
-                    )
+            st.bar_chart(
+                capacity_chart20,
+                width="stretch",
+            )
 
-                    comparison_df20 = pd.DataFrame(
-                        comparison_rows20
-                    ).set_index("Складова")
+            st.markdown("#### Деталізація")
 
-                    st.bar_chart(
-                        comparison_df20,
-                        width="stretch",
-                    )
+            display_cols20 = [
+                "component",
+                "mass_kg",
+                "cp_kj_kg_k",
+                "thermal_capacity_kj_k",
+                "energy_per_1k_kwh",
+                "capacity_share_pct",
+                "source_note",
+            ]
 
-                    st.caption(
-                        "Графік наведений лише для порівняння "
-                        "масштабу окремих складових. Вони ще не "
-                        "підсумовуються в загальну теплову потребу "
-                        "до формування єдиного енергетичного балансу."
-                    )
+            existing_cols20 = [
+                col
+                for col in display_cols20
+                if col in construction_result20.columns
+            ]
 
-                st.download_button(
-                    "Завантажити розрахунок нагрівання конструкцій",
-                    data=dataframe_to_csv_bytes(
-                        construction_result20
-                    ),
-                    file_name=(
-                        "stage20_construction_heating.csv"
-                    ),
-                    mime="text/csv",
-                    width="stretch",
-                    key="download_stage20_construction",
-                )
+            st.dataframe(
+                construction_result20.loc[
+                    construction_result20["include"],
+                    existing_cols20,
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.success(
+                "Пункт 20 не містить довільної температури "
+                "конструкції. Отримане Cконстр буде використане "
+                "пізніше в нестаціонарному енергетичному балансі."
+            )
+
+            st.download_button(
+                "Завантажити теплову ємність конструкцій",
+                data=dataframe_to_csv_bytes(
+                    construction_result20
+                ),
+                file_name=(
+                    "stage20_construction_thermal_capacity.csv"
+                ),
+                mime="text/csv",
+                width="stretch",
+                key="download_stage20_capacity",
+            )
 
 # ---------------------------------------------------------------------
 # 16. ТЕПЛОВІ ВТРАТИ СУШИЛЬНОЇ КАМЕРИ
