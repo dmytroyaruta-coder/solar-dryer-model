@@ -8410,8 +8410,11 @@ with tab_construction_heating:
     )
 
     st.caption(
-        "Десятковий роздільник у числових полях Streamlit — крапка. "
-        "Не вмикайте рядок, доки відповідні параметри не підтверджені."
+        "Поля нижче об'єднані у форму. Під час введення чисел "
+        "програма не перераховується після кожної зміни. "
+        "Усі введені значення застосовуються лише після натискання "
+        "кнопки «Зберегти дані п.20». "
+        "Десятковий роздільник у Streamlit — крапка."
     )
 
     construction_mass_mode = st.radio(
@@ -8421,11 +8424,15 @@ with tab_construction_heating:
             "Розрахувати масу за геометрією і густиною",
         ],
         index=0,
-        key="stage20_construction_mass_mode_v2",
+        key="stage20_construction_mass_mode_v3",
     )
 
     components20 = None
+    stage20_saved_now = False
 
+    # -------------------------------------------------------------
+    # 20A. Direct mass input
+    # -------------------------------------------------------------
     if construction_mass_mode == "Ввести фактичну масу елементів":
 
         if (
@@ -8472,41 +8479,86 @@ with tab_construction_heating:
             "елемента відома зі специфікації, креслення або зважування."
         )
 
-        construction_editor = st.data_editor(
+        # If values were already saved earlier, show them again as the
+        # starting values of the form.
+        direct_form_source20 = st.session_state.get(
+            "stage20_saved_direct_components",
             st.session_state[
                 "stage20_direct_components_verified_default"
             ],
-            num_rows="dynamic",
-            width="stretch",
-            hide_index=True,
-            key="stage20_direct_components_editor_v2",
-            column_config={
-                "include": st.column_config.CheckboxColumn(
-                    "Враховувати",
-                ),
-                "component": st.column_config.TextColumn(
-                    "Елемент",
-                ),
-                "mass_kg": st.column_config.NumberColumn(
-                    "m, кг",
-                    min_value=0.0,
-                    step=0.01,
-                    format="%.3f",
-                ),
-                "cp_kj_kg_k": st.column_config.NumberColumn(
-                    "cₚ, кДж/(кг·К)",
-                    min_value=0.0,
-                    step=0.001,
-                    format="%.3f",
-                ),
-                "source_note": st.column_config.TextColumn(
-                    "Джерело / примітка",
-                ),
-            },
         )
 
-        components20 = construction_editor.copy()
+        with st.form(
+            "stage20_direct_input_form",
+            clear_on_submit=False,
+        ):
+            construction_editor = st.data_editor(
+                direct_form_source20,
+                num_rows="dynamic",
+                width="stretch",
+                hide_index=True,
+                key="stage20_direct_components_editor_v3",
+                column_config={
+                    "include": st.column_config.CheckboxColumn(
+                        "Враховувати",
+                    ),
+                    "component": st.column_config.TextColumn(
+                        "Елемент",
+                    ),
+                    "mass_kg": st.column_config.NumberColumn(
+                        "m, кг",
+                        min_value=0.0,
+                        step=0.01,
+                        format="%.3f",
+                    ),
+                    "cp_kj_kg_k": st.column_config.NumberColumn(
+                        "cₚ, кДж/(кг·К)",
+                        min_value=0.0,
+                        step=0.001,
+                        format="%.3f",
+                    ),
+                    "source_note": st.column_config.TextColumn(
+                        "Джерело / примітка",
+                    ),
+                },
+            )
 
+            direct_submit20 = st.form_submit_button(
+                "Зберегти дані п.20",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if direct_submit20:
+            st.session_state[
+                "stage20_saved_direct_components"
+            ] = construction_editor.copy()
+
+            st.session_state[
+                "stage20_saved_components_active"
+            ] = construction_editor.copy()
+
+            st.session_state[
+                "stage20_saved_mass_mode"
+            ] = construction_mass_mode
+
+            stage20_saved_now = True
+
+        if (
+            st.session_state.get(
+                "stage20_saved_mass_mode"
+            )
+            == construction_mass_mode
+            and "stage20_saved_direct_components"
+            in st.session_state
+        ):
+            components20 = st.session_state[
+                "stage20_saved_direct_components"
+            ].copy()
+
+    # -------------------------------------------------------------
+    # 20B. Geometry-based mass input
+    # -------------------------------------------------------------
     else:
         if "dryer_geometry" not in st.session_state:
             st.warning(
@@ -8613,89 +8665,148 @@ with tab_construction_heating:
                     ]
                 )
 
-            geometry_editor20 = st.data_editor(
+            geometry_form_source20 = st.session_state.get(
+                "stage20_saved_geometry_components_raw",
                 st.session_state[
                     "stage20_geometry_components_verified_default"
                 ],
-                num_rows="dynamic",
-                width="stretch",
-                hide_index=True,
-                key="stage20_geometry_components_editor_v2",
-                column_config={
-                    "include": st.column_config.CheckboxColumn(
-                        "Враховувати",
-                    ),
-                    "component": st.column_config.TextColumn(
-                        "Елемент / матеріал",
-                    ),
-                    "area_m2": st.column_config.NumberColumn(
-                        "A, м²",
-                        min_value=0.0,
-                        step=0.01,
-                        format="%.3f",
-                    ),
-                    "thickness_mm": st.column_config.NumberColumn(
-                        "δ, мм",
-                        min_value=0.0,
-                        step=0.01,
-                        format="%.2f",
-                    ),
-                    "density_kg_m3": st.column_config.NumberColumn(
-                        "ρ, кг/м³",
-                        min_value=0.0,
-                        step=0.01,
-                        format="%.2f",
-                    ),
-                    "cp_kj_kg_k": st.column_config.NumberColumn(
-                        "cₚ, кДж/(кг·К)",
-                        min_value=0.0,
-                        step=0.001,
-                        format="%.3f",
-                    ),
-                    "source_note": st.column_config.TextColumn(
-                        "Джерело / примітка",
-                    ),
-                },
             )
 
-            components20 = geometry_editor20.copy()
+            with st.form(
+                "stage20_geometry_input_form",
+                clear_on_submit=False,
+            ):
+                geometry_editor20 = st.data_editor(
+                    geometry_form_source20,
+                    num_rows="dynamic",
+                    width="stretch",
+                    hide_index=True,
+                    key="stage20_geometry_components_editor_v3",
+                    column_config={
+                        "include": st.column_config.CheckboxColumn(
+                            "Враховувати",
+                        ),
+                        "component": st.column_config.TextColumn(
+                            "Елемент / матеріал",
+                        ),
+                        "area_m2": st.column_config.NumberColumn(
+                            "A, м²",
+                            min_value=0.0,
+                            step=0.01,
+                            format="%.3f",
+                        ),
+                        "thickness_mm": st.column_config.NumberColumn(
+                            "δ, мм",
+                            min_value=0.0,
+                            step=0.01,
+                            format="%.2f",
+                        ),
+                        "density_kg_m3": st.column_config.NumberColumn(
+                            "ρ, кг/м³",
+                            min_value=0.0,
+                            step=0.01,
+                            format="%.2f",
+                        ),
+                        "cp_kj_kg_k": st.column_config.NumberColumn(
+                            "cₚ, кДж/(кг·К)",
+                            min_value=0.0,
+                            step=0.001,
+                            format="%.3f",
+                        ),
+                        "source_note": st.column_config.TextColumn(
+                            "Джерело / примітка",
+                        ),
+                    },
+                )
 
-            components20["mass_kg"] = (
-                pd.to_numeric(
-                    components20["area_m2"],
-                    errors="coerce",
-                ).fillna(0.0)
-                * (
+                geometry_submit20 = st.form_submit_button(
+                    "Зберегти дані п.20",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if geometry_submit20:
+                geometry_saved20 = geometry_editor20.copy()
+
+                # Mass is calculated only after the user submits the form.
+                geometry_saved20["mass_kg"] = (
                     pd.to_numeric(
-                        components20["thickness_mm"],
+                        geometry_saved20["area_m2"],
                         errors="coerce",
                     ).fillna(0.0)
-                    / 1000.0
+                    * (
+                        pd.to_numeric(
+                            geometry_saved20["thickness_mm"],
+                            errors="coerce",
+                        ).fillna(0.0)
+                        / 1000.0
+                    )
+                    * pd.to_numeric(
+                        geometry_saved20["density_kg_m3"],
+                        errors="coerce",
+                    ).fillna(0.0)
                 )
-                * pd.to_numeric(
-                    components20["density_kg_m3"],
-                    errors="coerce",
-                ).fillna(0.0)
-            )
 
-            st.write(
-                "Маса, отримана лише з введених параметрів:"
-            )
+                st.session_state[
+                    "stage20_saved_geometry_components_raw"
+                ] = geometry_editor20.copy()
 
-            st.dataframe(
-                components20[
-                    [
-                        "include",
-                        "component",
-                        "mass_kg",
-                        "source_note",
-                    ]
-                ],
-                width="stretch",
-                hide_index=True,
-            )
+                st.session_state[
+                    "stage20_saved_geometry_components"
+                ] = geometry_saved20.copy()
 
-    if components20 is not None:
+                st.session_state[
+                    "stage20_saved_components_active"
+                ] = geometry_saved20.copy()
+
+                st.session_state[
+                    "stage20_saved_mass_mode"
+                ] = construction_mass_mode
+
+                stage20_saved_now = True
+
+            if (
+                st.session_state.get(
+                    "stage20_saved_mass_mode"
+                )
+                == construction_mass_mode
+                and "stage20_saved_geometry_components"
+                in st.session_state
+            ):
+                components20 = st.session_state[
+                    "stage20_saved_geometry_components"
+                ].copy()
+
+                st.write(
+                    "Маса, розрахована після останнього збереження:"
+                )
+
+                st.dataframe(
+                    components20[
+                        [
+                            "include",
+                            "component",
+                            "mass_kg",
+                            "source_note",
+                        ]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+
+    if stage20_saved_now:
+        st.success(
+            "Дані п.20 збережено. Розрахунок оновлено."
+        )
+
+    if components20 is None:
+        st.info(
+            "Заповніть усі потрібні поля та натисніть "
+            "«Зберегти дані п.20». До цього моменту введення "
+            "не запускає розрахунок."
+        )
+
+    else:
         try:
             (
                 construction_result20,
@@ -8809,9 +8920,8 @@ with tab_construction_heating:
             )
 
             st.success(
-                "Пункт 20 не містить довільної температури "
-                "конструкції. Отримане Cконстр буде використане "
-                "пізніше в нестаціонарному енергетичному балансі."
+                "Результати нижче відповідають останньому "
+                "збереженому набору параметрів п.20."
             )
 
             st.download_button(
