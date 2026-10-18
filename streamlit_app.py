@@ -6355,6 +6355,1388 @@ def calculate_unified_heat_balance_stage23(
 
 
 
+
+def calculate_product_temperature_stage24(
+    coupled_profile: pd.DataFrame,
+    dry_matter_kg: float,
+    initial_total_mass_kg: float,
+    initial_product_temp_c: float,
+    dry_matter_cp_kj_kg_k: float,
+    water_cp_kj_kg_k: float,
+    step_minutes: int,
+    equivalent_kernel_diameter_m: float = 0.00406,
+    reference_kernel_density_kg_m3: float = 1360.0,
+    max_product_temp_c: float | None = None,
+) -> tuple[pd.DataFrame, dict[str, float | int | str]]:
+    """
+    Пункт 24A. Динамічна температура продукту.
+
+    Модель не вводить довільний h між зерном і повітрям.
+    h визначається за критеріальною залежністю для обтікання
+    зернівки:
+
+        Re = rho * v * d_e / mu
+        Nu = 2 + 0.6 * Re^0.5 * Pr^(1/3)
+        h  = Nu * lambda_air / d_e
+
+    Для оцінки повної зовнішньої поверхні партії використовується:
+
+        alpha_v = 6 / d_e
+        V_kernel,0 = m_0 / rho_kernel
+        A_p = alpha_v * V_kernel,0
+
+    Значення d_e = 4.06 mm відповідає пшениці cv. Pionier
+    у Ramaj et al. (2021), тобто тому самому джерелу, на якому
+    базується кінетична модель Page у цій програмі.
+
+    rho_kernel = 1360 kg/m3 — довідкове значення густини зернівки
+    пшениці; воно використовується лише для переходу від
+    kernel-specific surface area до площі всієї партії.
+
+    Енергетичне рівняння продукту на часовому кроці:
+
+        C_p * dT_p/dt =
+            (h*A_p)*(T_air - T_p)
+            - m_dot_evap * h_fg(T_p)
+
+    де:
+        C_p = m_dry*c_p,dry + m_w*c_p,w
+
+    Для стійкості при кроці 10 хв конвективний член інтегрується
+    неявно.
+
+    ВАЖЛИВО:
+    це одностороннє теплове уточнення вже розрахованого п.15.
+    Воно НЕ перераховує Page-кінетику після зміни T_p і не змінює
+    зональні T_air та d. Тому результат є наступним рівнем
+    наближення, а не повністю спряженою CFD/heat-mass моделлю.
+    """
+    import numpy as np
+
+    required = {
+        "active_drying_command",
+        "zonal_air_inlet_temp_c",
+        "zonal_air_outlet_temp_c",
+        "zonal_air_inlet_humidity_ratio_kg_kg",
+        "zonal_air_outlet_humidity_ratio_kg_kg",
+        "PS",
+        "air_velocity_m_s",
+        "actual_water_removed_interval_kg",
+        "zonal_average_x_start_db_kg_kg",
+        "zonal_average_x_end_db_kg_kg",
+    }
+
+    missing = required - set(coupled_profile.columns)
+    if missing:
+        raise ValueError(
+            "Для динаміки продукту в п.24 відсутні: "
+            + ", ".join(sorted(missing))
+        )
+
+    if step_minutes <= 0:
+        raise ValueError("Крок часу має бути > 0.")
+
+    if dry_matter_kg <= 0 or initial_total_mass_kg <= 0:
+        raise ValueError("Маси продукту мають бути > 0.")
+
+    if equivalent_kernel_diameter_m <= 0:
+        raise ValueError("Еквівалентний діаметр зернівки має бути > 0.")
+
+    if reference_kernel_density_kg_m3 <= 0:
+        raise ValueError("Густина зернівки має бути > 0.")
+
+    result = coupled_profile.copy()
+    n = len(result)
+
+    active = (
+        result["active_drying_command"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    t_air_mean = (
+        pd.to_numeric(
+            result["zonal_air_inlet_temp_c"],
+            errors="coerce",
+        )
+        + pd.to_numeric(
+            result["zonal_air_outlet_temp_c"],
+            errors="coerce",
+        )
+    ) / 2.0
+
+    w_air_mean = (
+        pd.to_numeric(
+            result["zonal_air_inlet_humidity_ratio_kg_kg"],
+            errors="coerce",
+        )
+        + pd.to_numeric(
+            result["zonal_air_outlet_humidity_ratio_kg_kg"],
+            errors="coerce",
+        )
+    ) / 2.0
+
+    pressure_kpa = pd.to_numeric(
+        result["PS"],
+        errors="coerce",
+    )
+
+    velocity_m_s = pd.to_numeric(
+        result["air_velocity_m_s"],
+        errors="coerce",
+    )
+
+    air_props = air_transport_properties_stage21(
+        temperature_c=t_air_mean,
+        humidity_ratio_kg_kg=w_air_mean,
+        pressure_kpa=pressure_kpa,
+    )
+
+    re_p = (
+        air_props["rho_kg_m3"]
+        * velocity_m_s
+        * float(equivalent_kernel_diameter_m)
+        / air_props["mu_pa_s"]
+    )
+
+    nu_p = (
+        2.0
+        + 0.6
+        * re_p.clip(lower=0.0) ** 0.5
+        * air_props["prandtl"] ** (1.0 / 3.0)
+    )
+
+    h_p_w_m2_k = (
+        nu_p
+        * air_props["k_w_m_k"]
+        / float(equivalent_kernel_diameter_m)
+    )
+
+    alpha_v_m2_m3 = (
+        6.0 / float(equivalent_kernel_diameter_m)
+    )
+
+    initial_kernel_volume_m3 = (
+        float(initial_total_mass_kg)
+        / float(reference_kernel_density_kg_m3)
+    )
+
+    effective_external_area_m2 = (
+        alpha_v_m2_m3
+        * initial_kernel_volume_m3
+    )
+
+    ua_p_kw_k = (
+        h_p_w_m2_k
+        * effective_external_area_m2
+        / 1000.0
+    )
+
+    dt_s = float(step_minutes) * 60.0
+    dt_h = float(step_minutes) / 60.0
+
+    t_old = float(initial_product_temp_c)
+
+    temp_start = []
+    temp_end = []
+    cp_total_kj_k = []
+    water_mass_kg = []
+    latent_power_kw = []
+    convective_power_kw = []
+    sensible_storage_power_kw = []
+    balance_residual_kw = []
+    hfg_kj_kg = []
+
+    for i in range(n):
+        temp_start.append(t_old)
+
+        x_start = pd.to_numeric(
+            pd.Series(
+                [result.iloc[i]["zonal_average_x_start_db_kg_kg"]]
+            ),
+            errors="coerce",
+        ).iloc[0]
+
+        if pd.isna(x_start):
+            m_w = float("nan")
+            c_p_total = float("nan")
+        else:
+            m_w = (
+                float(dry_matter_kg)
+                * float(x_start)
+            )
+            c_p_total = (
+                float(dry_matter_kg)
+                * float(dry_matter_cp_kj_kg_k)
+                + m_w
+                * float(water_cp_kj_kg_k)
+            )
+
+        water_mass_kg.append(m_w)
+        cp_total_kj_k.append(c_p_total)
+
+        if (
+            not bool(active.iloc[i])
+            or pd.isna(t_air_mean.iloc[i])
+            or pd.isna(ua_p_kw_k.iloc[i])
+            or ua_p_kw_k.iloc[i] <= 0
+            or not pd.notna(c_p_total)
+            or c_p_total <= 0
+        ):
+            t_new = t_old
+            q_lat = 0.0
+            q_conv = 0.0
+            q_sens = 0.0
+            residual = 0.0
+            hfg = (
+                2501.0
+                - 2.326 * float(t_old)
+            )
+        else:
+            removed_kg = float(
+                max(
+                    0.0,
+                    pd.to_numeric(
+                        pd.Series(
+                            [
+                                result.iloc[i][
+                                    "actual_water_removed_interval_kg"
+                                ]
+                            ]
+                        ),
+                        errors="coerce",
+                    ).fillna(0.0).iloc[0],
+                )
+            )
+
+            m_dot_evap_kg_s = (
+                removed_kg / dt_s
+            )
+
+            hfg = (
+                2501.0
+                - 2.326 * float(t_old)
+            )
+
+            q_lat = (
+                m_dot_evap_kg_s
+                * hfg
+            )
+
+            c_over_dt_kw_k = (
+                c_p_total / dt_s
+            )
+
+            ua = float(
+                ua_p_kw_k.iloc[i]
+            )
+
+            ta = float(
+                t_air_mean.iloc[i]
+            )
+
+            # Implicit convection, latent term evaluated at T_old.
+            t_new = (
+                c_over_dt_kw_k * t_old
+                + ua * ta
+                - q_lat
+            ) / (
+                c_over_dt_kw_k
+                + ua
+            )
+
+            q_conv = (
+                ua
+                * (ta - t_new)
+            )
+
+            q_sens = (
+                c_over_dt_kw_k
+                * (t_new - t_old)
+            )
+
+            residual = (
+                q_conv
+                - q_lat
+                - q_sens
+            )
+
+        temp_end.append(t_new)
+        latent_power_kw.append(q_lat)
+        convective_power_kw.append(q_conv)
+        sensible_storage_power_kw.append(q_sens)
+        balance_residual_kw.append(residual)
+        hfg_kj_kg.append(hfg)
+
+        t_old = float(t_new)
+
+    result["stage24_product_air_mean_temp_c"] = (
+        t_air_mean
+    )
+
+    result["stage24_product_temp_start_c"] = (
+        temp_start
+    )
+
+    result["stage24_product_temp_end_c"] = (
+        temp_end
+    )
+
+    result["stage24_product_water_mass_kg"] = (
+        water_mass_kg
+    )
+
+    result["stage24_product_heat_capacity_kj_k"] = (
+        cp_total_kj_k
+    )
+
+    result["stage24_product_re"] = re_p
+    result["stage24_product_nu"] = nu_p
+
+    result["stage24_product_h_w_m2_k"] = (
+        h_p_w_m2_k
+    )
+
+    result["stage24_product_ua_kw_k"] = (
+        ua_p_kw_k
+    )
+
+    result["stage24_product_hfg_kj_kg"] = (
+        hfg_kj_kg
+    )
+
+    result["stage24_product_latent_power_kw"] = (
+        latent_power_kw
+    )
+
+    result["stage24_product_convective_power_kw"] = (
+        convective_power_kw
+    )
+
+    result["stage24_product_sensible_storage_kw"] = (
+        sensible_storage_power_kw
+    )
+
+    result["stage24_product_balance_residual_kw"] = (
+        balance_residual_kw
+    )
+
+    result[
+        "stage24_product_sensible_energy_kwh_interval"
+    ] = (
+        result[
+            "stage24_product_sensible_storage_kw"
+        ]
+        * dt_h
+    )
+
+    result[
+        "stage24_product_sensible_energy_kwh_cumulative"
+    ] = (
+        result[
+            "stage24_product_sensible_energy_kwh_interval"
+        ]
+        .cumsum()
+    )
+
+    active_mask = active & pd.Series(
+        temp_end,
+        index=result.index,
+    ).notna()
+
+    max_temp = (
+        float(
+            pd.Series(
+                temp_end,
+                index=result.index,
+            )
+            .loc[active_mask]
+            .max()
+        )
+        if active_mask.any()
+        else float("nan")
+    )
+
+    final_temp = (
+        float(
+            pd.Series(
+                temp_end,
+                index=result.index,
+            )
+            .loc[active_mask]
+            .iloc[-1]
+        )
+        if active_mask.any()
+        else float(initial_product_temp_c)
+    )
+
+    sensible_energy_kwh = float(
+        result[
+            "stage24_product_sensible_energy_kwh_interval"
+        ].sum()
+    )
+
+    max_balance_residual_kw = float(
+        pd.Series(
+            balance_residual_kw,
+            dtype="float64",
+        ).abs().max()
+    )
+
+    max_temp_exceeded = (
+        bool(
+            max_product_temp_c is not None
+            and pd.notna(max_temp)
+            and max_temp > float(max_product_temp_c)
+        )
+    )
+
+    summary = {
+        "initial_product_temp_c": (
+            float(initial_product_temp_c)
+        ),
+        "final_product_temp_c": (
+            final_temp
+        ),
+        "max_product_temp_c_model": (
+            max_temp
+        ),
+        "max_product_temp_limit_c": (
+            float(max_product_temp_c)
+            if max_product_temp_c is not None
+            else float("nan")
+        ),
+        "max_product_temp_exceeded": (
+            max_temp_exceeded
+        ),
+        "equivalent_kernel_diameter_mm": (
+            float(equivalent_kernel_diameter_m)
+            * 1000.0
+        ),
+        "reference_kernel_density_kg_m3": (
+            float(reference_kernel_density_kg_m3)
+        ),
+        "kernel_specific_surface_area_m2_m3": (
+            alpha_v_m2_m3
+        ),
+        "effective_product_surface_area_m2": (
+            effective_external_area_m2
+        ),
+        "mean_product_h_w_m2_k": (
+            float(
+                h_p_w_m2_k.loc[
+                    active
+                ].mean()
+            )
+            if active.any()
+            else float("nan")
+        ),
+        "mean_product_re": (
+            float(
+                re_p.loc[
+                    active
+                ].mean()
+            )
+            if active.any()
+            else float("nan")
+        ),
+        "mean_product_nu": (
+            float(
+                nu_p.loc[
+                    active
+                ].mean()
+            )
+            if active.any()
+            else float("nan")
+        ),
+        "product_sensible_energy_kwh": (
+            sensible_energy_kwh
+        ),
+        "max_product_energy_balance_residual_kw": (
+            max_balance_residual_kw
+        ),
+        "coupling_status": (
+            "одностороннє теплове уточнення п.15; "
+            "кінетика Page повторно не перераховується"
+        ),
+    }
+
+    return result, summary
+
+
+def simulate_multilayer_wall_stage24(
+    construction_components: pd.DataFrame,
+    heat_loss_profile: pd.DataFrame,
+    initial_construction_temp_c: float,
+    step_minutes: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | int | str]]:
+    """
+    Пункт 24B. Нестаціонарна температура багатошарового огородження.
+
+    Для кожного вузла огородження формується 1D RC-ланцюг.
+    Кожен матеріальний шар — окремий тепловий вузол із:
+
+        C_i = m_i*c_p,i
+
+    Опір між центрами сусідніх шарів:
+
+        R_i,i+1 =
+            delta_i/(2*lambda_i*A)
+            + delta_i+1/(2*lambda_i+1*A)
+
+    Внутрішня межа:
+
+        R_in =
+            1/(h_in*A)
+            + delta_1/(2*lambda_1*A)
+
+    Зовнішня межа:
+
+        R_out =
+            delta_n/(2*lambda_n*A)
+            + 1/(h_out*A)
+
+    Система інтегрується неявним методом Euler, тому тонкі
+    металеві шари не створюють числової нестійкості при кроці 10 хв.
+
+    Початкова температура всіх шарів задається ОДНІЄЮ явною
+    початковою умовою. У UI вона не маскується під виміряне значення:
+    за замовчуванням використовується явно позначене припущення
+    теплової рівноваги із зовнішнім повітрям на старті.
+    """
+    import numpy as np
+
+    required_components = {
+        "include",
+        "element_role",
+        "assembly",
+        "component",
+        "area_m2",
+        "thickness_mm",
+        "thermal_conductivity_w_m_k",
+        "mass_kg",
+        "cp_kj_kg_k",
+    }
+
+    missing = (
+        required_components
+        - set(construction_components.columns)
+    )
+
+    if missing:
+        raise ValueError(
+            "Для RC-моделі огородження відсутні: "
+            + ", ".join(sorted(missing))
+        )
+
+    required_profile = {
+        "active_drying_command",
+        "heat_loss_chamber_temp_c",
+        "heat_loss_ambient_temp_c",
+        "h_inside_w_m2_k",
+        "h_outside_w_m2_k",
+    }
+
+    missing_profile = (
+        required_profile
+        - set(heat_loss_profile.columns)
+    )
+
+    if missing_profile:
+        raise ValueError(
+            "У профілі п.21 відсутні: "
+            + ", ".join(sorted(missing_profile))
+        )
+
+    if step_minutes <= 0:
+        raise ValueError("Крок часу має бути > 0.")
+
+    layers = construction_components.copy()
+
+    layers = layers.loc[
+        layers["include"].fillna(False).astype(bool)
+        & (
+            layers["element_role"].astype(str)
+            == "Шар огородження"
+        )
+    ].copy()
+
+    if layers.empty:
+        raise ValueError(
+            "У п.20 немає активних шарів огородження."
+        )
+
+    for col in [
+        "area_m2",
+        "thickness_mm",
+        "thermal_conductivity_w_m_k",
+        "mass_kg",
+        "cp_kj_kg_k",
+    ]:
+        layers[col] = pd.to_numeric(
+            layers[col],
+            errors="coerce",
+        )
+
+    invalid = (
+        layers[
+            [
+                "area_m2",
+                "thickness_mm",
+                "thermal_conductivity_w_m_k",
+                "mass_kg",
+                "cp_kj_kg_k",
+            ]
+        ]
+        .isna()
+        .any(axis=1)
+        | (layers["area_m2"] <= 0)
+        | (layers["thickness_mm"] <= 0)
+        | (
+            layers[
+                "thermal_conductivity_w_m_k"
+            ]
+            <= 0
+        )
+        | (layers["mass_kg"] <= 0)
+        | (layers["cp_kj_kg_k"] <= 0)
+    )
+
+    if invalid.any():
+        bad = (
+            layers.loc[
+                invalid,
+                "component",
+            ]
+            .astype(str)
+            .tolist()
+        )
+        raise ValueError(
+            "Некоректні властивості шарів: "
+            + ", ".join(bad)
+        )
+
+    active = (
+        heat_loss_profile[
+            "active_drying_command"
+        ]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    dt_s = float(step_minutes) * 60.0
+    dt_h = float(step_minutes) / 60.0
+
+    result = heat_loss_profile.copy()
+
+    q_chamber_total_kw = pd.Series(
+        0.0,
+        index=result.index,
+        dtype="float64",
+    )
+
+    q_ambient_total_kw = pd.Series(
+        0.0,
+        index=result.index,
+        dtype="float64",
+    )
+
+    q_storage_total_kw = pd.Series(
+        0.0,
+        index=result.index,
+        dtype="float64",
+    )
+
+    residual_total_kw = pd.Series(
+        0.0,
+        index=result.index,
+        dtype="float64",
+    )
+
+    temp_weighted_numerator = pd.Series(
+        0.0,
+        index=result.index,
+        dtype="float64",
+    )
+
+    total_capacity_kj_k = 0.0
+
+    node_records = []
+
+    for assembly_name, group in layers.groupby(
+        "assembly",
+        sort=False,
+    ):
+        group = group.copy()
+
+        areas = group["area_m2"].to_numpy(
+            dtype=float
+        )
+
+        if (
+            float(areas.max())
+            - float(areas.min())
+            > 1e-6
+        ):
+            raise ValueError(
+                f"Вузол «{assembly_name}» має різні площі шарів."
+            )
+
+        area = float(areas[0])
+
+        delta_m = (
+            group["thickness_mm"]
+            .to_numpy(dtype=float)
+            / 1000.0
+        )
+
+        lamb = group[
+            "thermal_conductivity_w_m_k"
+        ].to_numpy(dtype=float)
+
+        c_j_k = (
+            group["mass_kg"].to_numpy(
+                dtype=float
+            )
+            * group["cp_kj_kg_k"].to_numpy(
+                dtype=float
+            )
+            * 1000.0
+        )
+
+        c_kj_k = c_j_k / 1000.0
+
+        n_layers = len(group)
+
+        if n_layers < 1:
+            continue
+
+        t_nodes = np.full(
+            n_layers,
+            float(initial_construction_temp_c),
+            dtype=float,
+        )
+
+        total_capacity_kj_k += float(
+            c_kj_k.sum()
+        )
+
+        # Resistances between adjacent layer centres, K/W.
+        r_between = []
+
+        for j in range(n_layers - 1):
+            r_j = (
+                delta_m[j]
+                / (
+                    2.0
+                    * lamb[j]
+                    * area
+                )
+                + delta_m[j + 1]
+                / (
+                    2.0
+                    * lamb[j + 1]
+                    * area
+                )
+            )
+            r_between.append(r_j)
+
+        for i in range(len(result)):
+            t_start = t_nodes.copy()
+
+            if not bool(active.iloc[i]):
+                q_in_kw = 0.0
+                q_out_kw = 0.0
+                q_storage_kw = 0.0
+                residual_kw = 0.0
+                t_new = t_nodes.copy()
+            else:
+                h_in = float(
+                    result.iloc[i][
+                        "h_inside_w_m2_k"
+                    ]
+                )
+
+                h_out = float(
+                    result.iloc[i][
+                        "h_outside_w_m2_k"
+                    ]
+                )
+
+                t_air = float(
+                    result.iloc[i][
+                        "heat_loss_chamber_temp_c"
+                    ]
+                )
+
+                t_amb = float(
+                    result.iloc[i][
+                        "heat_loss_ambient_temp_c"
+                    ]
+                )
+
+                if (
+                    not all(
+                        pd.notna(v)
+                        for v in [
+                            h_in,
+                            h_out,
+                            t_air,
+                            t_amb,
+                        ]
+                    )
+                    or h_in <= 0
+                    or h_out <= 0
+                ):
+                    raise ValueError(
+                        "Для активного інтервалу п.21 відсутній "
+                        "валідний h або температура."
+                    )
+
+                r_in = (
+                    1.0 / (h_in * area)
+                    + delta_m[0]
+                    / (
+                        2.0
+                        * lamb[0]
+                        * area
+                    )
+                )
+
+                r_out = (
+                    delta_m[-1]
+                    / (
+                        2.0
+                        * lamb[-1]
+                        * area
+                    )
+                    + 1.0 / (
+                        h_out * area
+                    )
+                )
+
+                g_in = 1.0 / r_in
+                g_out = 1.0 / r_out
+
+                g_between = [
+                    1.0 / r
+                    for r in r_between
+                ]
+
+                matrix = np.zeros(
+                    (n_layers, n_layers),
+                    dtype=float,
+                )
+
+                rhs = np.zeros(
+                    n_layers,
+                    dtype=float,
+                )
+
+                for j in range(n_layers):
+                    c_dt = (
+                        c_j_k[j] / dt_s
+                    )
+
+                    matrix[j, j] += c_dt
+                    rhs[j] += (
+                        c_dt
+                        * t_nodes[j]
+                    )
+
+                    if j == 0:
+                        matrix[j, j] += g_in
+                        rhs[j] += (
+                            g_in * t_air
+                        )
+                    else:
+                        g_left = (
+                            g_between[j - 1]
+                        )
+                        matrix[j, j] += g_left
+                        matrix[j, j - 1] -= g_left
+
+                    if j == n_layers - 1:
+                        matrix[j, j] += g_out
+                        rhs[j] += (
+                            g_out * t_amb
+                        )
+                    else:
+                        g_right = (
+                            g_between[j]
+                        )
+                        matrix[j, j] += g_right
+                        matrix[j, j + 1] -= g_right
+
+                t_new = np.linalg.solve(
+                    matrix,
+                    rhs,
+                )
+
+                q_in_kw = (
+                    g_in
+                    * (t_air - t_new[0])
+                    / 1000.0
+                )
+
+                q_out_kw = (
+                    g_out
+                    * (
+                        t_new[-1]
+                        - t_amb
+                    )
+                    / 1000.0
+                )
+
+                q_storage_kw = float(
+                    (
+                        c_j_k
+                        * (
+                            t_new
+                            - t_nodes
+                        )
+                    ).sum()
+                    / dt_s
+                    / 1000.0
+                )
+
+                residual_kw = (
+                    q_in_kw
+                    - q_out_kw
+                    - q_storage_kw
+                )
+
+            t_nodes = t_new
+
+            q_chamber_total_kw.iloc[i] += (
+                q_in_kw
+            )
+
+            q_ambient_total_kw.iloc[i] += (
+                q_out_kw
+            )
+
+            q_storage_total_kw.iloc[i] += (
+                q_storage_kw
+            )
+
+            residual_total_kw.iloc[i] += (
+                residual_kw
+            )
+
+            temp_weighted_numerator.iloc[i] += float(
+                (
+                    c_kj_k
+                    * t_nodes
+                ).sum()
+            )
+
+            for j, (_, row_layer) in enumerate(
+                group.iterrows()
+            ):
+                node_records.append(
+                    {
+                        "time_position": i,
+                        "assembly": assembly_name,
+                        "layer_index": j + 1,
+                        "component": str(
+                            row_layer[
+                                "component"
+                            ]
+                        ),
+                        "temp_start_c": float(
+                            t_start[j]
+                        ),
+                        "temp_end_c": float(
+                            t_nodes[j]
+                        ),
+                        "capacity_kj_k": float(
+                            c_kj_k[j]
+                        ),
+                    }
+                )
+
+    if total_capacity_kj_k <= 0:
+        raise ValueError(
+            "Сумарна теплоємність огородження має бути > 0."
+        )
+
+    result[
+        "stage24_wall_chamber_to_wall_kw"
+    ] = q_chamber_total_kw
+
+    result[
+        "stage24_wall_to_ambient_kw"
+    ] = q_ambient_total_kw
+
+    result[
+        "stage24_wall_storage_kw"
+    ] = q_storage_total_kw
+
+    result[
+        "stage24_wall_balance_residual_kw"
+    ] = residual_total_kw
+
+    result[
+        "stage24_wall_mean_temp_c"
+    ] = (
+        temp_weighted_numerator
+        / total_capacity_kj_k
+    )
+
+    result[
+        "stage24_wall_chamber_energy_kwh_interval"
+    ] = (
+        q_chamber_total_kw
+        * dt_h
+    )
+
+    result[
+        "stage24_wall_ambient_energy_kwh_interval"
+    ] = (
+        q_ambient_total_kw
+        * dt_h
+    )
+
+    result[
+        "stage24_wall_storage_energy_kwh_interval"
+    ] = (
+        q_storage_total_kw
+        * dt_h
+    )
+
+    result[
+        "stage24_wall_chamber_energy_kwh_cumulative"
+    ] = (
+        result[
+            "stage24_wall_chamber_energy_kwh_interval"
+        ].cumsum()
+    )
+
+    node_df = pd.DataFrame(
+        node_records
+    )
+
+    active_rows = result.loc[
+        active
+    ]
+
+    summary = {
+        "initial_construction_temp_c": (
+            float(initial_construction_temp_c)
+        ),
+        "final_capacity_weighted_wall_temp_c": (
+            float(
+                active_rows[
+                    "stage24_wall_mean_temp_c"
+                ].iloc[-1]
+            )
+            if not active_rows.empty
+            else float(initial_construction_temp_c)
+        ),
+        "total_wall_capacity_kj_k": (
+            float(total_capacity_kj_k)
+        ),
+        "peak_chamber_to_wall_kw": (
+            float(
+                active_rows[
+                    "stage24_wall_chamber_to_wall_kw"
+                ].max()
+            )
+            if not active_rows.empty
+            else 0.0
+        ),
+        "chamber_to_wall_energy_kwh": (
+            float(
+                result[
+                    "stage24_wall_chamber_energy_kwh_interval"
+                ].sum()
+            )
+        ),
+        "wall_to_ambient_energy_kwh": (
+            float(
+                result[
+                    "stage24_wall_ambient_energy_kwh_interval"
+                ].sum()
+            )
+        ),
+        "wall_storage_change_kwh": (
+            float(
+                result[
+                    "stage24_wall_storage_energy_kwh_interval"
+                ].sum()
+            )
+        ),
+        "max_wall_energy_balance_residual_kw": (
+            float(
+                residual_total_kw.abs().max()
+            )
+        ),
+        "initial_condition_note": (
+            "усі активні шари огородження стартують "
+            "з однієї явно заданої початкової температури"
+        ),
+    }
+
+    return result, node_df, summary
+
+
+def calculate_corrected_heat_balance_stage24(
+    air_heating_profile: pd.DataFrame,
+    recuperation_profile: pd.DataFrame,
+    product_dynamic_profile: pd.DataFrame,
+    wall_dynamic_profile: pd.DataFrame,
+    step_minutes: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | str]]:
+    """
+    Пункт 24C. Уточнений часовий баланс джерела.
+
+    Порівняно з п.23:
+      - стаціонарний Qdot_loss п.21 замінюється на
+        нестаціонарний потік з повітря камери в огородження;
+      - додається ТІЛЬКИ sensible-storage продукту;
+      - latent Q_evap окремо не додається, бо він уже описаний
+        ізоентальпійним охолодженням/зволоженням повітря в п.15.
+
+    Для сценарію epsilon:
+        Qdot_source,corr =
+            max(Qdot_air - epsilon*Qdot_rec,max, 0)
+            + Qdot_product,sens
+            + Qdot_wall,chamber
+
+    Це все ще one-way corrected model:
+    отримані Qdot_product,sens і Qdot_wall,chamber не повертаються
+    назад у Page-кінетику п.15. Тому п.24 є уточненим замиканням,
+    але не повністю спряженою ітераційною моделлю.
+    """
+    if step_minutes <= 0:
+        raise ValueError("Крок часу має бути > 0.")
+
+    n = len(air_heating_profile)
+
+    if not (
+        len(recuperation_profile) == n
+        and len(product_dynamic_profile) == n
+        and len(wall_dynamic_profile) == n
+    ):
+        raise ValueError(
+            "Часові профілі п.17, п.22 та п.24 мають різну довжину."
+        )
+
+    required_air = {
+        "air_heating_power_kw",
+        "active_drying_command",
+    }
+
+    required_rec = {
+        "recup_qmax_sensible_kw",
+    }
+
+    required_product = {
+        "stage24_product_sensible_storage_kw",
+    }
+
+    required_wall = {
+        "stage24_wall_chamber_to_wall_kw",
+    }
+
+    checks = [
+        (
+            required_air,
+            air_heating_profile,
+            "п.17",
+        ),
+        (
+            required_rec,
+            recuperation_profile,
+            "п.22",
+        ),
+        (
+            required_product,
+            product_dynamic_profile,
+            "п.24 продукт",
+        ),
+        (
+            required_wall,
+            wall_dynamic_profile,
+            "п.24 конструкція",
+        ),
+    ]
+
+    for required, frame, name in checks:
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(
+                f"У {name} відсутні: "
+                + ", ".join(sorted(missing))
+            )
+
+    result = air_heating_profile.copy()
+
+    active = (
+        air_heating_profile[
+            "active_drying_command"
+        ]
+        .fillna(False)
+        .astype(bool)
+        .reset_index(drop=True)
+    )
+
+    q_air = pd.to_numeric(
+        air_heating_profile[
+            "air_heating_power_kw"
+        ],
+        errors="coerce",
+    ).fillna(0.0).reset_index(drop=True)
+
+    q_rec_max = pd.to_numeric(
+        recuperation_profile[
+            "recup_qmax_sensible_kw"
+        ],
+        errors="coerce",
+    ).fillna(0.0).reset_index(drop=True)
+
+    q_product = pd.to_numeric(
+        product_dynamic_profile[
+            "stage24_product_sensible_storage_kw"
+        ],
+        errors="coerce",
+    ).fillna(0.0).reset_index(drop=True)
+
+    q_wall = pd.to_numeric(
+        wall_dynamic_profile[
+            "stage24_wall_chamber_to_wall_kw"
+        ],
+        errors="coerce",
+    ).fillna(0.0).reset_index(drop=True)
+
+    dt_h = float(step_minutes) / 60.0
+
+    epsilon_values = [
+        0.0,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+        1.0,
+    ]
+
+    rows = []
+
+    for epsilon in epsilon_values:
+        q_air_after_rec = (
+            q_air
+            - float(epsilon)
+            * q_rec_max
+        ).clip(lower=0.0)
+
+        q_source = (
+            q_air_after_rec
+            + q_product
+            + q_wall
+        )
+
+        q_source = q_source.where(
+            active,
+            0.0,
+        )
+
+        energy_kwh = float(
+            (
+                q_source
+                * dt_h
+            ).sum()
+        )
+
+        rows.append(
+            {
+                "effectiveness": float(epsilon),
+                "air_after_rec_kwh": float(
+                    (
+                        q_air_after_rec
+                        * dt_h
+                    ).sum()
+                ),
+                "product_sensible_kwh": float(
+                    (
+                        q_product
+                        * dt_h
+                    ).sum()
+                ),
+                "dynamic_wall_load_kwh": float(
+                    (
+                        q_wall
+                        * dt_h
+                    ).sum()
+                ),
+                "corrected_source_energy_kwh": (
+                    energy_kwh
+                ),
+                "peak_corrected_source_kw": float(
+                    q_source.max()
+                ),
+            }
+        )
+
+        if epsilon in {
+            0.0,
+            0.5,
+            1.0,
+        }:
+            result[
+                f"stage24_corrected_source_eps_{int(epsilon*100)}_kw"
+            ] = q_source.to_numpy()
+
+    scenarios = pd.DataFrame(
+        rows
+    )
+
+    summary = {
+        "product_sensible_energy_kwh": float(
+            (
+                q_product
+                * dt_h
+            ).sum()
+        ),
+        "dynamic_wall_load_energy_kwh": float(
+            (
+                q_wall
+                * dt_h
+            ).sum()
+        ),
+        "corrected_source_no_rec_kwh": float(
+            scenarios.loc[
+                scenarios["effectiveness"] == 0.0,
+                "corrected_source_energy_kwh",
+            ].iloc[0]
+        ),
+        "corrected_source_eps50_kwh": float(
+            scenarios.loc[
+                scenarios["effectiveness"] == 0.5,
+                "corrected_source_energy_kwh",
+            ].iloc[0]
+        ),
+        "corrected_source_eps100_kwh": float(
+            scenarios.loc[
+                scenarios["effectiveness"] == 1.0,
+                "corrected_source_energy_kwh",
+            ].iloc[0]
+        ),
+        "model_status": (
+            "уточнений one-way динамічний баланс; "
+            "без повторної ітерації Page-кінетики"
+        ),
+    }
+
+    return result, scenarios, summary
+
+
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -6370,7 +7752,7 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–23: вихідні дані, масовий баланс, режими, "
+    "Етапи 1–24: вихідні дані, масовий баланс, режими, "
     "погодні дані, психрометрія, геометрія, кінетика Page, "
     "рівноважна вологість та формування системи "
     "тепло- і масообміну сушильної камери."
@@ -6383,7 +7765,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation, tab_product_heating, tab_construction_heating, tab_heat_losses, tab_recuperation, tab_heat_balance = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation, tab_product_heating, tab_construction_heating, tab_heat_losses, tab_recuperation, tab_heat_balance, tab_dynamic_closure = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -6403,6 +7785,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "16. Теплові втрати",
         "17. Рекуперація",
         "18. Зведений тепловий баланс",
+        "19. Динаміка продукту і конструкції",
     ]
 )
 
@@ -12230,10 +13613,721 @@ with tab_heat_balance:
                 key="download_stage23_scenarios",
             )
 
-            st.info(
-                "Наступний логічний крок — визначити, як замкнути "
-                "динамічні члени нагрівання продукту та конструкції, "
-                "після чого перейти до потрібної теплової потужності "
-                "джерела і моделі сонячного колектора."
+
+# ---------------------------------------------------------------------
+# 19. ДИНАМІКА ПРОДУКТУ І КОНСТРУКЦІЇ
+# ---------------------------------------------------------------------
+with tab_dynamic_closure:
+    st.subheader(
+        "Етап 24. Динаміка температури продукту і конструкції"
+    )
+
+    st.info(
+        "Цей етап уточнює п.23 без довільного розподілу інтегральної "
+        "енергії по часу. Для зерна використовується тепловий баланс "
+        "із критеріально розрахованим коефіцієнтом тепловіддачі. "
+        "Для стінки — нестаціонарний багатошаровий RC-розрахунок."
+    )
+
+    st.warning(
+        "П.24 поки є одностороннім тепловим уточненням: отримані "
+        "Tпрод(t) і нестаціонарний тепловий потік у стінку не "
+        "повертаються назад у Page-кінетику п.15. Тому це значно "
+        "кращий енергетичний баланс, але ще не повністю спряжена "
+        "ітераційна модель сушіння."
+    )
+
+    prerequisites24 = [
+        "coupled_drying_profile",
+        "product_heating_summary",
+        "construction_thermal_capacity_components",
+        "heat_loss_profile",
+        "air_heating_profile",
+        "recuperation_profile",
+    ]
+
+    missing24 = [
+        key
+        for key in prerequisites24
+        if key not in st.session_state
+    ]
+
+    if missing24:
+        st.warning(
+            "Для п.24 спочатку потрібні результати попередніх етапів. "
+            "Відсутні: "
+            + ", ".join(missing24)
+        )
+
+    else:
+        coupled24 = st.session_state[
+            "coupled_drying_profile"
+        ]
+
+        product_summary24 = st.session_state[
+            "product_heating_summary"
+        ]
+
+        construction_components24 = st.session_state[
+            "construction_thermal_capacity_components"
+        ]
+
+        heat_loss24 = st.session_state[
+            "heat_loss_profile"
+        ]
+
+        balance24 = calculate_mass_balance(
+            float(initial_mass_kg),
+            float(product["initial_moisture_pct"]),
+            float(product["final_moisture_pct"]),
+        )
+
+        st.markdown(
+            "#### 24A. Динамічна температура зерна"
+        )
+
+        st.write(
+            "Для того самого сорту/джерела, що використовується "
+            "в Page-моделі, Ramaj et al. (2021) наводять "
+            "еквівалентний діаметр зернівки **4.06 ± 0.21 мм**. "
+            "У тепловій підмоделі використано dₑ = 4.06 мм. "
+            "Для переходу до площі всієї партії використано "
+            "довідкову густину зернівки пшениці 1360 кг/м³. "
+            "Ці значення явно показуються, а не приховуються як "
+            "невідомі експериментальні дані нашої установки."
+        )
+
+        st.latex(
+            r"\mathrm{Nu}_p="
+            r"2+0.6\,\mathrm{Re}_p^{1/2}"
+            r"\mathrm{Pr}^{1/3}"
+        )
+
+        st.latex(
+            r"h_p="
+            r"\frac{\mathrm{Nu}_p\lambda_{\mathrm{air}}}{d_e}"
+        )
+
+        st.latex(
+            r"C_p(t)\frac{dT_p}{dt}"
+            r"=h_pA_p\left(T_{\mathrm{air}}-T_p\right)"
+            r"-\dot m_{\mathrm{evap}}h_{fg}(T_p)"
+        )
+
+        try:
+            (
+                product_dynamic24,
+                product_dynamic_summary24,
+            ) = calculate_product_temperature_stage24(
+                coupled_profile=coupled24,
+                dry_matter_kg=float(
+                    balance24["dry_matter_kg"]
+                ),
+                initial_total_mass_kg=float(
+                    initial_mass_kg
+                ),
+                initial_product_temp_c=float(
+                    product_summary24[
+                        "initial_product_temp_c"
+                    ]
+                ),
+                dry_matter_cp_kj_kg_k=float(
+                    product_summary24[
+                        "dry_matter_cp_kj_kg_k"
+                    ]
+                ),
+                water_cp_kj_kg_k=float(
+                    product_summary24[
+                        "water_cp_kj_kg_k"
+                    ]
+                ),
+                step_minutes=int(
+                    model_step_minutes
+                ),
+                equivalent_kernel_diameter_m=0.00406,
+                reference_kernel_density_kg_m3=1360.0,
+                max_product_temp_c=float(
+                    product.get(
+                        "max_product_temp_c",
+                        product[
+                            "target_drying_temp_c"
+                        ],
+                    )
+                ),
             )
+
+        except Exception as exc:
+            st.error(str(exc))
+            product_dynamic24 = None
+            product_dynamic_summary24 = None
+
+        if product_dynamic24 is not None:
+            st.session_state[
+                "stage24_product_dynamic_profile"
+            ] = product_dynamic24
+
+            st.session_state[
+                "stage24_product_dynamic_summary"
+            ] = product_dynamic_summary24
+
+            p1, p2, p3, p4 = st.columns(4)
+
+            p1.metric(
+                "Tₚ,0",
+                (
+                    f"{product_dynamic_summary24['initial_product_temp_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            p2.metric(
+                "Tₚ,кін",
+                (
+                    f"{product_dynamic_summary24['final_product_temp_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            p3.metric(
+                "Tₚ,max",
+                (
+                    f"{product_dynamic_summary24['max_product_temp_c_model']:.2f} "
+                    "°C"
+                ),
+            )
+
+            p4.metric(
+                "Qпрод,чутл",
+                (
+                    f"{product_dynamic_summary24['product_sensible_energy_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            p5, p6, p7, p8 = st.columns(4)
+
+            p5.metric(
+                "dₑ",
+                (
+                    f"{product_dynamic_summary24['equivalent_kernel_diameter_mm']:.2f} "
+                    "мм"
+                ),
+            )
+
+            p6.metric(
+                "Aₚ,еф",
+                (
+                    f"{product_dynamic_summary24['effective_product_surface_area_m2']:.2f} "
+                    "м²"
+                ),
+            )
+
+            p7.metric(
+                "hₚ,сер",
+                (
+                    f"{product_dynamic_summary24['mean_product_h_w_m2_k']:.2f} "
+                    "Вт/(м²·К)"
+                ),
+            )
+
+            p8.metric(
+                "Reₚ,сер",
+                (
+                    f"{product_dynamic_summary24['mean_product_re']:.1f}"
+                ),
+            )
+
+            if product_dynamic_summary24[
+                "max_product_temp_exceeded"
+            ]:
+                st.error(
+                    "Розрахована температура продукту перевищує "
+                    "задану допустиму межу."
+                )
+            else:
+                st.success(
+                    "За поточною тепловою підмоделлю допустима "
+                    "температура продукту не перевищена."
+                )
+
+            st.line_chart(
+                product_dynamic24[
+                    [
+                        "stage24_product_air_mean_temp_c",
+                        "stage24_product_temp_end_c",
+                    ]
+                ].rename(
+                    columns={
+                        "stage24_product_air_mean_temp_c": (
+                            "Tпов,сер, °C"
+                        ),
+                        "stage24_product_temp_end_c": (
+                            "Tₚ, °C"
+                        ),
+                    }
+                ),
+                width="stretch",
+            )
+
+            st.line_chart(
+                product_dynamic24[
+                    [
+                        "stage24_product_convective_power_kw",
+                        "stage24_product_latent_power_kw",
+                        "stage24_product_sensible_storage_kw",
+                    ]
+                ].rename(
+                    columns={
+                        "stage24_product_convective_power_kw": (
+                            "Q̇пов→прод, кВт"
+                        ),
+                        "stage24_product_latent_power_kw": (
+                            "Q̇вип,прод, кВт"
+                        ),
+                        "stage24_product_sensible_storage_kw": (
+                            "Q̇прод,чутл, кВт"
+                        ),
+                    }
+                ),
+                width="stretch",
+            )
+
+            st.caption(
+                "У баланс джерела нижче додається тільки "
+                "Q̇прод,чутл. Латентна складова вдруге не додається, "
+                "оскільки вона вже закладена в ізоентальпійному "
+                "охолодженні/зволоженні повітря п.15."
+            )
+
+        st.markdown(
+            "#### 24B. Нестаціонарне огородження"
+        )
+
+        first_active24 = (
+            coupled24[
+                "active_drying_command"
+            ]
+            .fillna(False)
+            .astype(bool)
+        )
+
+        if first_active24.any():
+            first_active_index24 = (
+                first_active24[
+                    first_active24
+                ].index[0]
+            )
+
+            default_wall_initial24 = float(
+                pd.to_numeric(
+                    coupled24.loc[
+                        first_active_index24,
+                        "T2M",
+                    ],
+                    errors="coerce",
+                )
+            )
+        else:
+            default_wall_initial24 = float(
+                pd.to_numeric(
+                    coupled24["T2M"],
+                    errors="coerce",
+                ).iloc[0]
+            )
+
+        st.write(
+            "Для нестаціонарного розрахунку потрібна початкова "
+            "температура огородження. Вона не підставляється як "
+            "нібито відоме виміряне значення."
+        )
+
+        wall_initial_mode24 = st.radio(
+            "Початкова умова огородження",
+            options=[
+                "Прийняти теплову рівновагу із зовнішнім повітрям на старті",
+                "Ввести відоме значення",
+            ],
+            index=0,
+            key="stage24_wall_initial_mode",
+        )
+
+        if (
+            wall_initial_mode24
+            == "Прийняти теплову рівновагу із зовнішнім повітрям на старті"
+        ):
+            wall_initial_temp24 = float(
+                default_wall_initial24
+            )
+
+            st.caption(
+                "Модельна початкова умова: "
+                f"Tконстр,0 = Tзовн,0 = {wall_initial_temp24:.2f} °C. "
+                "Вона означає, що до запуску сушарка достатньо довго "
+                "перебувала без нагрівання."
+            )
+
+        else:
+            wall_initial_temp24 = st.number_input(
+                "Підтверджена початкова температура конструкції, °C",
+                value=float(default_wall_initial24),
+                step=0.1,
+                format="%.2f",
+                key="stage24_wall_initial_temp_c",
+            )
+
+            st.caption(
+                "Використовуйте цей режим, якщо початкова температура "
+                "корпусу відома з вимірювання або окремо обґрунтована."
+            )
+
+        st.latex(
+            r"R_{\mathrm{вн}}="
+            r"\frac{1}{h_{\mathrm{вн}}A}"
+            r"+\frac{\delta_1}{2\lambda_1A}"
+        )
+
+        st.latex(
+            r"R_{i,i+1}="
+            r"\frac{\delta_i}{2\lambda_iA}"
+            r"+\frac{\delta_{i+1}}{2\lambda_{i+1}A}"
+        )
+
+        try:
+            (
+                wall_dynamic24,
+                wall_nodes24,
+                wall_dynamic_summary24,
+            ) = simulate_multilayer_wall_stage24(
+                construction_components=(
+                    construction_components24
+                ),
+                heat_loss_profile=heat_loss24,
+                initial_construction_temp_c=float(
+                    wall_initial_temp24
+                ),
+                step_minutes=int(
+                    model_step_minutes
+                ),
+            )
+
+        except Exception as exc:
+            st.error(str(exc))
+            wall_dynamic24 = None
+            wall_nodes24 = None
+            wall_dynamic_summary24 = None
+
+        if wall_dynamic24 is not None:
+            st.session_state[
+                "stage24_wall_dynamic_profile"
+            ] = wall_dynamic24
+
+            st.session_state[
+                "stage24_wall_node_profile"
+            ] = wall_nodes24
+
+            st.session_state[
+                "stage24_wall_dynamic_summary"
+            ] = wall_dynamic_summary24
+
+            w1, w2, w3, w4 = st.columns(4)
+
+            w1.metric(
+                "Tконстр,0",
+                (
+                    f"{wall_dynamic_summary24['initial_construction_temp_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            w2.metric(
+                "Tконстр,кін,серед",
+                (
+                    f"{wall_dynamic_summary24['final_capacity_weighted_wall_temp_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            w3.metric(
+                "Q̇пов→стінка,max",
+                (
+                    f"{wall_dynamic_summary24['peak_chamber_to_wall_kw']:.3f} "
+                    "кВт"
+                ),
+            )
+
+            w4.metric(
+                "Qпов→стінка",
+                (
+                    f"{wall_dynamic_summary24['chamber_to_wall_energy_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            w5, w6, w7 = st.columns(3)
+
+            w5.metric(
+                "Qстінка→зовн",
+                (
+                    f"{wall_dynamic_summary24['wall_to_ambient_energy_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            w6.metric(
+                "ΔUконстр",
+                (
+                    f"{wall_dynamic_summary24['wall_storage_change_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            w7.metric(
+                "Макс. нев'язка RC-балансу",
+                (
+                    f"{wall_dynamic_summary24['max_wall_energy_balance_residual_kw']:.6f} "
+                    "кВт"
+                ),
+            )
+
+            st.line_chart(
+                wall_dynamic24[
+                    [
+                        "heat_loss_chamber_temp_c",
+                        "stage24_wall_mean_temp_c",
+                        "heat_loss_ambient_temp_c",
+                    ]
+                ].rename(
+                    columns={
+                        "heat_loss_chamber_temp_c": (
+                            "Tкам, °C"
+                        ),
+                        "stage24_wall_mean_temp_c": (
+                            "Tконстр,сер, °C"
+                        ),
+                        "heat_loss_ambient_temp_c": (
+                            "Tзовн, °C"
+                        ),
+                    }
+                ),
+                width="stretch",
+            )
+
+            st.line_chart(
+                wall_dynamic24[
+                    [
+                        "stage24_wall_chamber_to_wall_kw",
+                        "stage24_wall_to_ambient_kw",
+                        "stage24_wall_storage_kw",
+                    ]
+                ].rename(
+                    columns={
+                        "stage24_wall_chamber_to_wall_kw": (
+                            "Q̇кам→стінка, кВт"
+                        ),
+                        "stage24_wall_to_ambient_kw": (
+                            "Q̇стінка→зовн, кВт"
+                        ),
+                        "stage24_wall_storage_kw": (
+                            "dUконстр/dt, кВт"
+                        ),
+                    }
+                ),
+                width="stretch",
+            )
+
+        if (
+            product_dynamic24 is not None
+            and wall_dynamic24 is not None
+        ):
+            st.markdown(
+                "#### 24C. Уточнений тепловий баланс джерела"
+            )
+
+            st.latex(
+                r"\dot Q_{\mathrm{дж,уточ}}"
+                r"="
+                r"\max\left("
+                r"\dot Q_{\mathrm{пов}}"
+                r"-\varepsilon_{\mathrm{рек}}"
+                r"\dot Q_{\max,\mathrm{рек}},0"
+                r"\right)"
+                r"+\dot Q_{\mathrm{прод,чутл}}"
+                r"+\dot Q_{\mathrm{кам\to стінка}}"
+            )
+
+            try:
+                (
+                    corrected_profile24,
+                    corrected_scenarios24,
+                    corrected_summary24,
+                ) = calculate_corrected_heat_balance_stage24(
+                    air_heating_profile=st.session_state[
+                        "air_heating_profile"
+                    ],
+                    recuperation_profile=st.session_state[
+                        "recuperation_profile"
+                    ],
+                    product_dynamic_profile=(
+                        product_dynamic24
+                    ),
+                    wall_dynamic_profile=(
+                        wall_dynamic24
+                    ),
+                    step_minutes=int(
+                        model_step_minutes
+                    ),
+                )
+
+            except Exception as exc:
+                st.error(str(exc))
+
+            else:
+                st.session_state[
+                    "stage24_corrected_heat_balance_profile"
+                ] = corrected_profile24
+
+                st.session_state[
+                    "stage24_corrected_heat_balance_scenarios"
+                ] = corrected_scenarios24
+
+                st.session_state[
+                    "stage24_corrected_heat_balance_summary"
+                ] = corrected_summary24
+
+                b1, b2, b3, b4 = st.columns(4)
+
+                b1.metric(
+                    "Qпрод,чутл",
+                    (
+                        f"{corrected_summary24['product_sensible_energy_kwh']:.3f} "
+                        "кВт·год"
+                    ),
+                )
+
+                b2.metric(
+                    "Qкам→стінка",
+                    (
+                        f"{corrected_summary24['dynamic_wall_load_energy_kwh']:.3f} "
+                        "кВт·год"
+                    ),
+                )
+
+                b3.metric(
+                    "Eдж, ε=0 %",
+                    (
+                        f"{corrected_summary24['corrected_source_no_rec_kwh']:.3f} "
+                        "кВт·год"
+                    ),
+                )
+
+                b4.metric(
+                    "Eдж, ε=50 %",
+                    (
+                        f"{corrected_summary24['corrected_source_eps50_kwh']:.3f} "
+                        "кВт·год"
+                    ),
+                )
+
+                scenarios_display24 = (
+                    corrected_scenarios24.copy()
+                )
+
+                scenarios_display24["effectiveness"] = (
+                    scenarios_display24[
+                        "effectiveness"
+                    ]
+                    * 100.0
+                )
+
+                scenarios_display24 = (
+                    scenarios_display24.rename(
+                        columns={
+                            "effectiveness": "εрек, %",
+                            "air_after_rec_kwh": (
+                                "Qпов після рек., кВт·год"
+                            ),
+                            "product_sensible_kwh": (
+                                "Qпрод,чутл, кВт·год"
+                            ),
+                            "dynamic_wall_load_kwh": (
+                                "Qкам→стінка, кВт·год"
+                            ),
+                            "corrected_source_energy_kwh": (
+                                "Eдж,уточ, кВт·год"
+                            ),
+                            "peak_corrected_source_kw": (
+                                "Q̇дж,max, кВт"
+                            ),
+                        }
+                    )
+                )
+
+                st.dataframe(
+                    scenarios_display24,
+                    width="stretch",
+                    hide_index=True,
+                )
+
+                st.line_chart(
+                    corrected_profile24[
+                        [
+                            "stage24_corrected_source_eps_0_kw",
+                            "stage24_corrected_source_eps_50_kw",
+                            "stage24_corrected_source_eps_100_kw",
+                        ]
+                    ].rename(
+                        columns={
+                            "stage24_corrected_source_eps_0_kw": (
+                                "Q̇дж, ε=0 %, кВт"
+                            ),
+                            "stage24_corrected_source_eps_50_kw": (
+                                "Q̇дж, ε=50 %, кВт"
+                            ),
+                            "stage24_corrected_source_eps_100_kw": (
+                                "Q̇дж, ε=100 %, кВт"
+                            ),
+                        }
+                    ),
+                    width="stretch",
+                )
+
+                st.warning(
+                    "Це уточнений, але ще не повністю спряжений баланс. "
+                    "Наступний рівень точності — повторно розв'язувати "
+                    "зональну модель п.15 із Tпрод(t) та нестаціонарним "
+                    "тепловим потоком у конструкцію всередині кожного "
+                    "10-хвилинного кроку."
+                )
+
+                st.download_button(
+                    "Завантажити часовий ряд п.24",
+                    data=dataframe_to_csv_bytes(
+                        corrected_profile24
+                    ),
+                    file_name=(
+                        "stage24_product_wall_dynamic_balance.csv"
+                    ),
+                    mime="text/csv",
+                    width="stretch",
+                    key="download_stage24_profile",
+                )
+
+                st.download_button(
+                    "Завантажити сценарії п.24",
+                    data=dataframe_to_csv_bytes(
+                        corrected_scenarios24
+                    ),
+                    file_name=(
+                        "stage24_corrected_heat_balance_scenarios.csv"
+                    ),
+                    mime="text/csv",
+                    width="stretch",
+                    key="download_stage24_scenarios",
+                )
+
+                st.info(
+                    "Після перевірки п.24 можна переходити до "
+                    "визначення потрібної теплової потужності джерела "
+                    "та моделі сонячного колектора."
+                )
 
