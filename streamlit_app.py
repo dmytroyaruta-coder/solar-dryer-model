@@ -5172,6 +5172,46 @@ def calculate_transmission_heat_losses_stage21(
         "gross_flow_area_m2": gross_flow_area_m2,
         "mean_h_inside_w_m2_k": mean_h_inside,
         "mean_h_outside_w_m2_k": mean_h_outside,
+        "mean_re_inside": (
+            float(
+                result.loc[
+                    active & valid_h,
+                    "re_inside",
+                ].mean()
+            )
+            if valid_active_count > 0
+            else float("nan")
+        ),
+        "mean_re_outside": (
+            float(
+                result.loc[
+                    active & valid_h,
+                    "re_outside",
+                ].mean()
+            )
+            if valid_active_count > 0
+            else float("nan")
+        ),
+        "mean_nu_inside": (
+            float(
+                result.loc[
+                    active & valid_h,
+                    "nu_inside",
+                ].mean()
+            )
+            if valid_active_count > 0
+            else float("nan")
+        ),
+        "mean_nu_outside": (
+            float(
+                result.loc[
+                    active & valid_h,
+                    "nu_outside",
+                ].mean()
+            )
+            if valid_active_count > 0
+            else float("nan")
+        ),
         "mean_ua_w_k": mean_ua,
         "mean_area_weighted_u_w_m2_k": (
             mean_u_area_weighted
@@ -5202,6 +5242,496 @@ def calculate_transmission_heat_losses_stage21(
         summary,
     )
 
+
+def calculate_recuperation_potential_stage22(
+    coupled_profile: pd.DataFrame,
+    step_minutes: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | int | str]]:
+    """
+    Пункт 22. Теоретичний потенціал рекуперації теплоти
+    відпрацьованого сушильного агента.
+
+    На цьому етапі НЕ задається ефективність конкретного
+    рекуператора, оскільки його тип і конструкція ще не вибрані.
+
+    Гарячий потік:
+        T_h,in = температура повітря після сушильної камери
+        w_h    = вологовміст повітря після камери
+
+    Холодний потік:
+        T_c,in = температура зовнішнього повітря
+        w_c    = зовнішній вологовміст
+
+    Для обох потоків використовується одна і та сама витрата
+    сухого повітря, що відповідає поточному повітрообміну сушарки.
+
+    Теплоємнісні витрати:
+        C_h = m_dot_da * (1.006 + 1.86*w_h)
+        C_c = m_dot_da * (1.006 + 1.86*w_c)
+
+    Теоретично максимальна потужність відчутної рекуперації:
+        Qdot_max = C_min * max(T_h,in - T_c,in, 0)
+
+    Для довільної ефективності epsilon:
+        Qdot_rec = epsilon * Qdot_max
+
+        T_c,out = T_c,in + Qdot_rec / C_c
+        T_h,out = T_h,in - Qdot_rec / C_h
+
+    Оскільки epsilon конкретного апарата ще невідома, програма
+    формує параметричну таблицю для epsilon=0...1, а не підставляє
+    довільне проєктне значення.
+
+    Додатково виконується лише діагностична перевірка:
+        T_h,out <= T_dp,h
+    тобто чи опустилась би середня температура гарячого потоку
+    нижче його точки роси. Це НЕ гарантує відсутності конденсації
+    на поверхні теплообмінника, бо для цього потрібна локальна
+    температура стінки та геометрія рекуператора.
+    """
+    import numpy as np
+
+    required = {
+        "T2M",
+        "PS",
+        "humidity_ratio_kg_kg",
+        "drying_air_temperature_c",
+        "dry_air_mass_flow_total_kg_h",
+        "active_drying_command",
+        "zonal_air_outlet_temp_c",
+        "zonal_air_outlet_humidity_ratio_kg_kg",
+    }
+
+    missing = required - set(coupled_profile.columns)
+    if missing:
+        raise ValueError(
+            "Для п.22 відсутні параметри: "
+            + ", ".join(sorted(missing))
+        )
+
+    if step_minutes <= 0:
+        raise ValueError(
+            "Крок моделювання має бути більшим за нуль."
+        )
+
+    result = coupled_profile.copy()
+
+    t_hot = pd.to_numeric(
+        result["zonal_air_outlet_temp_c"],
+        errors="coerce",
+    )
+
+    w_hot = pd.to_numeric(
+        result["zonal_air_outlet_humidity_ratio_kg_kg"],
+        errors="coerce",
+    )
+
+    t_cold = pd.to_numeric(
+        result["T2M"],
+        errors="coerce",
+    )
+
+    w_cold = pd.to_numeric(
+        result["humidity_ratio_kg_kg"],
+        errors="coerce",
+    )
+
+    t_target = pd.to_numeric(
+        result["drying_air_temperature_c"],
+        errors="coerce",
+    )
+
+    pressure_kpa = pd.to_numeric(
+        result["PS"],
+        errors="coerce",
+    )
+
+    mdot_da_kg_h = pd.to_numeric(
+        result["dry_air_mass_flow_total_kg_h"],
+        errors="coerce",
+    )
+
+    mdot_da_kg_s = (
+        mdot_da_kg_h / 3600.0
+    )
+
+    active = (
+        result["active_drying_command"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    cp_hot_kj_kg_da_k = (
+        1.006 + 1.86 * w_hot
+    )
+
+    cp_cold_kj_kg_da_k = (
+        1.006 + 1.86 * w_cold
+    )
+
+    c_hot_kw_k = (
+        mdot_da_kg_s
+        * cp_hot_kj_kg_da_k
+    )
+
+    c_cold_kw_k = (
+        mdot_da_kg_s
+        * cp_cold_kj_kg_da_k
+    )
+
+    c_min_kw_k = pd.concat(
+        [
+            c_hot_kw_k.rename("hot"),
+            c_cold_kw_k.rename("cold"),
+        ],
+        axis=1,
+    ).min(axis=1)
+
+    c_max_kw_k = pd.concat(
+        [
+            c_hot_kw_k.rename("hot"),
+            c_cold_kw_k.rename("cold"),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    capacity_ratio = (
+        c_min_kw_k / c_max_kw_k
+    ).where(
+        c_max_kw_k > 0
+    )
+
+    delta_t_in_c = (
+        t_hot - t_cold
+    )
+
+    qmax_kw = (
+        c_min_kw_k
+        * delta_t_in_c.clip(lower=0.0)
+    ).where(
+        active,
+        0.0,
+    )
+
+    # Baseline sensible heating demand of fresh air to target.
+    q_baseline_kw = (
+        c_cold_kw_k
+        * (t_target - t_cold).clip(lower=0.0)
+    ).where(
+        active,
+        0.0,
+    )
+
+    # Hot-stream dew point from humidity ratio and total pressure.
+    p_v_hot_kpa = (
+        w_hot
+        * pressure_kpa
+        / (0.621945 + w_hot)
+    )
+
+    gamma_hot = np.log(
+        p_v_hot_kpa / 0.61094
+    )
+
+    t_dp_hot_c = (
+        243.04
+        * gamma_hot
+        / (17.625 - gamma_hot)
+    )
+
+    # Effectiveness at which the bulk hot outlet would just reach
+    # the inlet hot-stream dew point.
+    q_bulk_dew_limit_kw = (
+        c_hot_kw_k
+        * (t_hot - t_dp_hot_c).clip(lower=0.0)
+    )
+
+    epsilon_bulk_dew_limit = (
+        q_bulk_dew_limit_kw / qmax_kw
+    ).where(
+        qmax_kw > 0
+    )
+
+    epsilon_bulk_dew_limit = (
+        epsilon_bulk_dew_limit
+        .clip(lower=0.0, upper=1.0)
+    )
+
+    dt_h = float(step_minutes) / 60.0
+
+    result["recup_hot_in_temp_c"] = t_hot
+    result["recup_hot_in_w_kg_kg"] = w_hot
+    result["recup_hot_in_dew_point_c"] = t_dp_hot_c
+
+    result["recup_cold_in_temp_c"] = t_cold
+    result["recup_cold_in_w_kg_kg"] = w_cold
+
+    result["recup_c_hot_kw_k"] = c_hot_kw_k
+    result["recup_c_cold_kw_k"] = c_cold_kw_k
+    result["recup_c_min_kw_k"] = c_min_kw_k
+    result["recup_capacity_ratio"] = capacity_ratio
+
+    result["recup_delta_t_in_c"] = delta_t_in_c
+    result["recup_qmax_sensible_kw"] = qmax_kw
+    result["recup_baseline_air_heating_kw"] = q_baseline_kw
+
+    result["recup_bulk_dew_epsilon_limit"] = (
+        epsilon_bulk_dew_limit
+    )
+
+    result["recup_qmax_energy_kwh_interval"] = (
+        qmax_kw * dt_h
+    )
+
+    result["recup_qmax_energy_kwh_cumulative"] = (
+        result[
+            "recup_qmax_energy_kwh_interval"
+        ].cumsum()
+    )
+
+    # ---------------------------------------------------------
+    # Parametric effectiveness table. No arbitrary design value.
+    # ---------------------------------------------------------
+    epsilon_values = [
+        0.0,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+        1.0,
+    ]
+
+    scenario_rows = []
+
+    active_recovery = (
+        active
+        & qmax_kw.notna()
+        & (qmax_kw > 0)
+        & (c_hot_kw_k > 0)
+        & (c_cold_kw_k > 0)
+    )
+
+    baseline_energy_kwh = float(
+        (q_baseline_kw * dt_h).sum()
+    )
+
+    qmax_energy_kwh = float(
+        (
+            result[
+                "recup_qmax_energy_kwh_interval"
+            ]
+        ).sum()
+    )
+
+    for epsilon in epsilon_values:
+        q_rec_kw = (
+            float(epsilon) * qmax_kw
+        )
+
+        t_cold_out = (
+            t_cold
+            + q_rec_kw / c_cold_kw_k
+        )
+
+        t_hot_out = (
+            t_hot
+            - q_rec_kw / c_hot_kw_k
+        )
+
+        residual_heating_kw = (
+            c_cold_kw_k
+            * (
+                t_target
+                - t_cold_out
+            ).clip(lower=0.0)
+        ).where(
+            active,
+            0.0,
+        )
+
+        condensation_diag = (
+            active_recovery
+            & t_hot_out.notna()
+            & t_dp_hot_c.notna()
+            & (
+                t_hot_out
+                <= t_dp_hot_c
+            )
+        )
+
+        recovered_energy_kwh = float(
+            (q_rec_kw * dt_h).sum()
+        )
+
+        residual_energy_kwh = float(
+            (
+                residual_heating_kw
+                * dt_h
+            ).sum()
+        )
+
+        scenario_rows.append(
+            {
+                "effectiveness": float(epsilon),
+                "recovered_energy_kwh": (
+                    recovered_energy_kwh
+                ),
+                "residual_air_heating_kwh": (
+                    residual_energy_kwh
+                ),
+                "air_heating_reduction_pct": (
+                    (
+                        1.0
+                        - residual_energy_kwh
+                        / baseline_energy_kwh
+                    )
+                    * 100.0
+                    if baseline_energy_kwh > 0
+                    else float("nan")
+                ),
+                "mean_cold_outlet_temp_c": (
+                    float(
+                        t_cold_out.loc[
+                            active_recovery
+                        ].mean()
+                    )
+                    if active_recovery.any()
+                    else float("nan")
+                ),
+                "mean_hot_outlet_temp_c": (
+                    float(
+                        t_hot_out.loc[
+                            active_recovery
+                        ].mean()
+                    )
+                    if active_recovery.any()
+                    else float("nan")
+                ),
+                "bulk_dewpoint_risk_intervals": int(
+                    condensation_diag.sum()
+                ),
+            }
+        )
+
+    scenarios = pd.DataFrame(
+        scenario_rows
+    )
+
+    valid_eps_limit = (
+        epsilon_bulk_dew_limit.loc[
+            active_recovery
+        ]
+        .dropna()
+    )
+
+    minimum_bulk_dew_limit = (
+        float(valid_eps_limit.min())
+        if not valid_eps_limit.empty
+        else float("nan")
+    )
+
+    mean_hot_in_temp = (
+        float(
+            t_hot.loc[
+                active_recovery
+            ].mean()
+        )
+        if active_recovery.any()
+        else float("nan")
+    )
+
+    mean_cold_in_temp = (
+        float(
+            t_cold.loc[
+                active_recovery
+            ].mean()
+        )
+        if active_recovery.any()
+        else float("nan")
+    )
+
+    mean_hot_dp = (
+        float(
+            t_dp_hot_c.loc[
+                active_recovery
+            ].mean()
+        )
+        if active_recovery.any()
+        else float("nan")
+    )
+
+    peak_qmax_kw = (
+        float(
+            qmax_kw.loc[
+                active_recovery
+            ].max()
+        )
+        if active_recovery.any()
+        else 0.0
+    )
+
+    mean_qmax_kw = (
+        float(
+            qmax_kw.loc[
+                active_recovery
+            ].mean()
+        )
+        if active_recovery.any()
+        else 0.0
+    )
+
+    summary = {
+        "active_recovery_interval_count": int(
+            active_recovery.sum()
+        ),
+        "mean_hot_inlet_temp_c": (
+            mean_hot_in_temp
+        ),
+        "mean_cold_inlet_temp_c": (
+            mean_cold_in_temp
+        ),
+        "mean_hot_inlet_dew_point_c": (
+            mean_hot_dp
+        ),
+        "peak_qmax_sensible_kw": (
+            peak_qmax_kw
+        ),
+        "mean_qmax_sensible_kw": (
+            mean_qmax_kw
+        ),
+        "qmax_sensible_energy_kwh": (
+            qmax_energy_kwh
+        ),
+        "baseline_air_heating_energy_kwh": (
+            baseline_energy_kwh
+        ),
+        "maximum_theoretical_heating_offset_pct": (
+            (
+                qmax_energy_kwh
+                / baseline_energy_kwh
+                * 100.0
+            )
+            if baseline_energy_kwh > 0
+            else float("nan")
+        ),
+        "minimum_bulk_dewpoint_effectiveness_limit": (
+            minimum_bulk_dew_limit
+        ),
+        "model_type": (
+            "сухий відчутний повітря-повітря рекуператор; "
+            "параметричний аналіз ефективності"
+        ),
+    }
+
+    return result, scenarios, summary
+
+
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -5217,7 +5747,7 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–21: вихідні дані, масовий баланс, режими, "
+    "Етапи 1–22: вихідні дані, масовий баланс, режими, "
     "погодні дані, психрометрія, геометрія, кінетика Page, "
     "рівноважна вологість та формування системи "
     "тепло- і масообміну сушильної камери."
@@ -5230,7 +5760,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation, tab_product_heating, tab_construction_heating, tab_heat_losses = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation, tab_product_heating, tab_construction_heating, tab_heat_losses, tab_recuperation = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -5248,6 +5778,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "14. Нагрівання продукту",
         "15. Конструкція і теплоємність",
         "16. Теплові втрати",
+        "17. Рекуперація",
     ]
 )
 
@@ -10077,6 +10608,36 @@ with tab_heat_losses:
                     "Vзовн = WS10M із погодного ряду NASA POWER."
                 )
 
+                r1, r2, r3, r4 = st.columns(4)
+
+                r1.metric(
+                    "Середній Reвн",
+                    (
+                        f"{heat_loss_summary21['mean_re_inside']:.0f}"
+                    ),
+                )
+
+                r2.metric(
+                    "Середній Nuвн",
+                    (
+                        f"{heat_loss_summary21['mean_nu_inside']:.2f}"
+                    ),
+                )
+
+                r3.metric(
+                    "Середній Reзовн",
+                    (
+                        f"{heat_loss_summary21['mean_re_outside']:.0f}"
+                    ),
+                )
+
+                r4.metric(
+                    "Середній Nuзовн",
+                    (
+                        f"{heat_loss_summary21['mean_nu_outside']:.2f}"
+                    ),
+                )
+
                 st.markdown(
                     "#### Коефіцієнт теплопередачі огородження"
                 )
@@ -10186,25 +10747,46 @@ with tab_heat_losses:
                     "#### Швидкості та коефіцієнти теплообміну"
                 )
 
-                h_chart21 = heat_loss_profile21[
-                    [
-                        "heat_loss_inside_bulk_velocity_m_s",
-                        "heat_loss_ws10m_m_s",
-                    ]
-                ].rename(
-                    columns={
-                        "heat_loss_inside_bulk_velocity_m_s": (
-                            "Vвн, м/с"
-                        ),
-                        "heat_loss_ws10m_m_s": (
-                            "WS10M, м/с"
-                        ),
-                    }
+                st.write(
+                    "**Внутрішня швидкість повітря**"
                 )
 
                 st.line_chart(
-                    h_chart21,
+                    heat_loss_profile21[
+                        [
+                            "heat_loss_inside_bulk_velocity_m_s",
+                        ]
+                    ].rename(
+                        columns={
+                            "heat_loss_inside_bulk_velocity_m_s": (
+                                "Vвн, м/с"
+                            ),
+                        }
+                    ),
                     width="stretch",
+                )
+
+                st.write(
+                    "**Зовнішня швидкість вітру NASA POWER**"
+                )
+
+                st.line_chart(
+                    heat_loss_profile21[
+                        [
+                            "heat_loss_ws10m_m_s",
+                        ]
+                    ].rename(
+                        columns={
+                            "heat_loss_ws10m_m_s": (
+                                "WS10M, м/с"
+                            ),
+                        }
+                    ),
+                    width="stretch",
+                )
+
+                st.write(
+                    "**Коефіцієнти поверхневого теплообміну**"
                 )
 
                 st.line_chart(
@@ -10311,7 +10893,328 @@ with tab_heat_losses:
                     key="download_stage21_envelope_v3",
                 )
 
-                st.info(
-                    "Після перевірки цього етапу переходимо до п.22 — "
-                    "рекуперації теплоти відпрацьованого сушильного агента."
+
+# ---------------------------------------------------------------------
+# 17. РЕКУПЕРАЦІЯ ТЕПЛОТИ ВІДПРАЦЬОВАНОГО СУШИЛЬНОГО АГЕНТА
+# ---------------------------------------------------------------------
+with tab_recuperation:
+    st.subheader(
+        "Етап 22. Потенціал рекуперації теплоти відпрацьованого повітря"
+    )
+
+    st.info(
+        "На цьому етапі не задається довільна ефективність "
+        "рекуператора. Спочатку визначається теоретично доступна "
+        "відчутна теплота відпрацьованого сушильного агента та "
+        "виконується параметричний аналіз для ε = 0…1."
+    )
+
+    st.markdown(
+        "#### Вхідні потоки"
+    )
+
+    st.latex(
+        r"T_{\mathrm{гар,вх}}(t)"
+        r"=T_{\mathrm{вих,кам}}(t)"
+    )
+
+    st.latex(
+        r"T_{\mathrm{хол,вх}}(t)"
+        r"=T_{\mathrm{зовн}}(t)"
+    )
+
+    st.latex(
+        r"C_{\mathrm{гар}}(t)"
+        r"=\dot m_{\mathrm{с.п.}}"
+        r"\left(1.006+1.86d_{\mathrm{гар}}\right)"
+    )
+
+    st.latex(
+        r"C_{\mathrm{хол}}(t)"
+        r"=\dot m_{\mathrm{с.п.}}"
+        r"\left(1.006+1.86d_{\mathrm{хол}}\right)"
+    )
+
+    st.latex(
+        r"\dot Q_{\max}(t)"
+        r"=C_{\min}(t)"
+        r"\max\left["
+        r"T_{\mathrm{гар,вх}}(t)"
+        r"-T_{\mathrm{хол,вх}}(t),0"
+        r"\right]"
+    )
+
+    st.write(
+        "Для конкретного рекуператора після визначення його "
+        "ефективності буде:"
+    )
+
+    st.latex(
+        r"\dot Q_{\mathrm{рек}}(t)"
+        r"=\varepsilon_{\mathrm{рек}}"
+        r"\dot Q_{\max}(t)"
+    )
+
+    st.warning(
+        "Поточна постановка відповідає сухому відчутному "
+        "повітря-повітря рекуператору. Якщо гарячий потік "
+        "охолоджується до точки роси, проста суха модель перестає "
+        "бути достатньою. Програма показує таку ситуацію лише як "
+        "діагностичний ризик конденсації за температурою середнього "
+        "гарячого потоку; локальна температура стінки теплообмінника "
+        "поки не моделюється."
+    )
+
+    if "coupled_drying_profile" not in st.session_state:
+        st.warning(
+            "Спочатку виконайте спільний розрахунок сушіння."
+        )
+
+    else:
+        try:
+            (
+                recuperation_profile22,
+                recuperation_scenarios22,
+                recuperation_summary22,
+            ) = calculate_recuperation_potential_stage22(
+                coupled_profile=st.session_state[
+                    "coupled_drying_profile"
+                ],
+                step_minutes=int(
+                    model_step_minutes
+                ),
+            )
+
+        except Exception as exc:
+            st.warning(str(exc))
+
+        else:
+            st.session_state[
+                "recuperation_profile"
+            ] = recuperation_profile22
+
+            st.session_state[
+                "recuperation_scenarios"
+            ] = recuperation_scenarios22
+
+            st.session_state[
+                "recuperation_summary"
+            ] = recuperation_summary22
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            c1.metric(
+                "Tгар,вх, сер",
+                (
+                    f"{recuperation_summary22['mean_hot_inlet_temp_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            c2.metric(
+                "Tхол,вх, сер",
+                (
+                    f"{recuperation_summary22['mean_cold_inlet_temp_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            c3.metric(
+                "Точка роси гарячого потоку",
+                (
+                    f"{recuperation_summary22['mean_hot_inlet_dew_point_c']:.2f} "
+                    "°C"
+                ),
+            )
+
+            c4.metric(
+                "Пікова Q̇max",
+                (
+                    f"{recuperation_summary22['peak_qmax_sensible_kw']:.3f} "
+                    "кВт"
+                ),
+            )
+
+            c5, c6, c7 = st.columns(3)
+
+            c5.metric(
+                "Середня Q̇max",
+                (
+                    f"{recuperation_summary22['mean_qmax_sensible_kw']:.3f} "
+                    "кВт"
+                ),
+            )
+
+            c6.metric(
+                "Теоретична Qmax за цикл",
+                (
+                    f"{recuperation_summary22['qmax_sensible_energy_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            c7.metric(
+                "Макс. компенсація нагрівання повітря",
+                (
+                    f"{recuperation_summary22['maximum_theoretical_heating_offset_pct']:.1f} "
+                    "%"
+                ),
+            )
+
+            st.markdown(
+                "#### Температури потоків і точка роси"
+            )
+
+            st.line_chart(
+                recuperation_profile22[
+                    [
+                        "recup_hot_in_temp_c",
+                        "recup_cold_in_temp_c",
+                        "recup_hot_in_dew_point_c",
+                    ]
+                ].rename(
+                    columns={
+                        "recup_hot_in_temp_c": (
+                            "Tгар,вх, °C"
+                        ),
+                        "recup_cold_in_temp_c": (
+                            "Tхол,вх, °C"
+                        ),
+                        "recup_hot_in_dew_point_c": (
+                            "Tdp,гар, °C"
+                        ),
+                    }
+                ),
+                width="stretch",
+            )
+
+            st.markdown(
+                "#### Теоретично доступна потужність рекуперації"
+            )
+
+            st.line_chart(
+                recuperation_profile22[
+                    [
+                        "recup_qmax_sensible_kw",
+                        "recup_baseline_air_heating_kw",
+                    ]
+                ].rename(
+                    columns={
+                        "recup_qmax_sensible_kw": (
+                            "Q̇max, кВт"
+                        ),
+                        "recup_baseline_air_heating_kw": (
+                            "Q̇нагр,без рекуп., кВт"
+                        ),
+                    }
+                ),
+                width="stretch",
+            )
+
+            st.markdown(
+                "#### Параметричний аналіз за ефективністю рекуператора"
+            )
+
+            scenarios_display22 = (
+                recuperation_scenarios22.copy()
+            )
+
+            scenarios_display22["effectiveness"] = (
+                scenarios_display22[
+                    "effectiveness"
+                ]
+                * 100.0
+            )
+
+            scenarios_display22 = (
+                scenarios_display22.rename(
+                    columns={
+                        "effectiveness": (
+                            "εрек, %"
+                        ),
+                        "recovered_energy_kwh": (
+                            "Qрек, кВт·год"
+                        ),
+                        "residual_air_heating_kwh": (
+                            "Qдогр, кВт·год"
+                        ),
+                        "air_heating_reduction_pct": (
+                            "Зменшення нагрівання, %"
+                        ),
+                        "mean_cold_outlet_temp_c": (
+                            "Tхол,вих,сер, °C"
+                        ),
+                        "mean_hot_outlet_temp_c": (
+                            "Tгар,вих,сер, °C"
+                        ),
+                        "bulk_dewpoint_risk_intervals": (
+                            "Інтервали з діагн. ризиком конденсації"
+                        ),
+                    }
                 )
+            )
+
+            st.dataframe(
+                scenarios_display22,
+                width="stretch",
+                hide_index=True,
+            )
+
+            eps_limit22 = recuperation_summary22[
+                "minimum_bulk_dewpoint_effectiveness_limit"
+            ]
+
+            if pd.notna(eps_limit22):
+                st.write(
+                    "Найменше значення ефективності, при якому "
+                    "за поточною **діагностикою середнього гарячого "
+                    "потоку** хоча б в одному активному інтервалі "
+                    "його розрахункова температура на виході досягає "
+                    "точки роси:"
+                )
+
+                st.metric(
+                    "ε за bulk-dewpoint діагностикою",
+                    f"{eps_limit22 * 100.0:.1f} %",
+                )
+
+                st.caption(
+                    "Це не є допустимою паспортною межею "
+                    "рекуператора і не гарантує відсутності "
+                    "конденсації на стінці. Для точної перевірки "
+                    "потрібні геометрія теплообмінника та локальні "
+                    "температури його поверхні."
+                )
+
+            st.download_button(
+                "Завантажити часовий ряд п.22",
+                data=dataframe_to_csv_bytes(
+                    recuperation_profile22
+                ),
+                file_name=(
+                    "stage22_recuperation_potential.csv"
+                ),
+                mime="text/csv",
+                width="stretch",
+                key="download_stage22_profile",
+            )
+
+            st.download_button(
+                "Завантажити сценарії ефективності п.22",
+                data=dataframe_to_csv_bytes(
+                    recuperation_scenarios22
+                ),
+                file_name=(
+                    "stage22_recuperation_effectiveness_scenarios.csv"
+                ),
+                mime="text/csv",
+                width="stretch",
+                key="download_stage22_scenarios",
+            )
+
+            st.info(
+                "Наступний етап — п.23: єдиний нестаціонарний "
+                "тепловий баланс сушильної камери без подвійного "
+                "обліку теплоти випаровування."
+            )
+
