@@ -4052,6 +4052,328 @@ def calculate_construction_thermal_capacity_stage20(
     return result, summary
 
 
+
+def upgrade_stage20_components_for_linkage(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Adds the stage-20/21 linkage fields to an older saved table
+    without deleting previously entered values.
+    """
+    out = df.copy()
+
+    defaults = {
+        "element_role": "Внутрішній елемент",
+        "assembly": "",
+        "area_m2": 0.0,
+        "thickness_mm": 0.0,
+        "density_kg_m3": 0.0,
+        "cp_kj_kg_k": 0.0,
+        "thermal_conductivity_w_m_k": 0.0,
+        "source_note": "",
+    }
+
+    for col, default in defaults.items():
+        if col not in out.columns:
+            out[col] = default
+
+    # Migration of the names used in the previous version.
+    component_text = (
+        out["component"]
+        .astype(str)
+        .str.lower()
+    )
+
+    envelope_mask = (
+        component_text.str.contains("корпус", na=False)
+        | component_text.str.contains("теплоізоля", na=False)
+        | component_text.str.contains("обшив", na=False)
+        | component_text.str.contains("стін", na=False)
+    )
+
+    out.loc[
+        envelope_mask
+        & (
+            out["element_role"].astype(str)
+            == "Внутрішній елемент"
+        ),
+        "element_role",
+    ] = "Шар огородження"
+
+    out.loc[
+        envelope_mask
+        & (
+            out["assembly"].astype(str).str.strip() == ""
+        ),
+        "assembly",
+    ] = "Основне огородження"
+
+    return out
+
+
+def build_envelope_assemblies_stage21(
+    construction_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Forms envelope assemblies directly from the saved stage-20 table.
+
+    Only active rows with element_role == "Шар огородження"
+    participate in the wall thermal-resistance calculation.
+
+    For each assembly:
+        R_layers = sum(delta_i / lambda_i)
+        U_layers = 1 / R_layers
+
+    U_layers is NOT the final air-to-air U-value because surface
+    convective resistances are not yet included.
+    """
+    required = {
+        "include",
+        "component",
+        "element_role",
+        "assembly",
+        "area_m2",
+        "thickness_mm",
+        "thermal_conductivity_w_m_k",
+    }
+
+    missing = required - set(construction_df.columns)
+    if missing:
+        raise ValueError(
+            "Для зв'язку п.20→п.21 відсутні колонки: "
+            + ", ".join(sorted(missing))
+        )
+
+    layers = construction_df.copy()
+
+    layers["include"] = (
+        layers["include"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    layers = layers.loc[
+        layers["include"]
+        & (
+            layers["element_role"].astype(str)
+            == "Шар огородження"
+        )
+    ].copy()
+
+    if layers.empty:
+        raise ValueError(
+            "У п.20 не позначено жодного активного рядка "
+            "як «Шар огородження»."
+        )
+
+    layers["assembly"] = (
+        layers["assembly"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    if (layers["assembly"] == "").any():
+        bad = layers.loc[
+            layers["assembly"] == "",
+            "component",
+        ].astype(str).tolist()
+
+        raise ValueError(
+            "Для шарів огородження потрібно вказати вузол "
+            "(наприклад «Основне огородження»): "
+            + ", ".join(bad)
+        )
+
+    for col in [
+        "area_m2",
+        "thickness_mm",
+        "thermal_conductivity_w_m_k",
+    ]:
+        layers[col] = pd.to_numeric(
+            layers[col],
+            errors="coerce",
+        )
+
+    invalid = (
+        layers["area_m2"].isna()
+        | (layers["area_m2"] <= 0)
+        | layers["thickness_mm"].isna()
+        | (layers["thickness_mm"] <= 0)
+        | layers["thermal_conductivity_w_m_k"].isna()
+        | (layers["thermal_conductivity_w_m_k"] <= 0)
+    )
+
+    if invalid.any():
+        bad = layers.loc[
+            invalid,
+            "component",
+        ].astype(str).tolist()
+
+        raise ValueError(
+            "Для розрахунку п.21 кожний активний шар огородження "
+            "повинен мати A>0, δ>0 та λ>0: "
+            + ", ".join(bad)
+        )
+
+    layers["thickness_m"] = (
+        layers["thickness_mm"] / 1000.0
+    )
+
+    layers["layer_resistance_m2_k_w"] = (
+        layers["thickness_m"]
+        / layers["thermal_conductivity_w_m_k"]
+    )
+
+    assemblies = []
+
+    for assembly_name, group in layers.groupby(
+        "assembly",
+        sort=False,
+    ):
+        areas = group["area_m2"].dropna()
+
+        if areas.empty:
+            raise ValueError(
+                f"Для вузла «{assembly_name}» не визначено площу."
+            )
+
+        area_min = float(areas.min())
+        area_max = float(areas.max())
+
+        # All layers of one plane assembly must cover the same area.
+        if abs(area_max - area_min) > 1e-6:
+            raise ValueError(
+                f"У вузлі «{assembly_name}» шари мають різні площі. "
+                "Для послідовної багатошарової стінки площа шарів "
+                "має бути однаковою. Якщо це окрема ділянка "
+                "(наприклад двері), задайте її як окремий вузол."
+            )
+
+        area = float(areas.iloc[0])
+
+        r_layers = float(
+            group[
+                "layer_resistance_m2_k_w"
+            ].sum()
+        )
+
+        if r_layers <= 0:
+            raise ValueError(
+                f"Для вузла «{assembly_name}» сумарний опір шарів "
+                "повинен бути більшим за нуль."
+            )
+
+        assemblies.append(
+            {
+                "assembly": assembly_name,
+                "area_m2": area,
+                "layer_count": int(len(group)),
+                "r_layers_m2_k_w": r_layers,
+                "u_layers_w_m2_k": 1.0 / r_layers,
+            }
+        )
+
+    return layers, pd.DataFrame(assemblies)
+
+
+def apply_surface_resistances_stage21(
+    assemblies_df: pd.DataFrame,
+    surface_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Adds surface convective resistances to each envelope assembly:
+
+        R_total = 1/h_in + R_layers + 1/h_out
+        U_total = 1/R_total
+
+    h_in and h_out are not invented in the model. They must be
+    independently calculated/confirmed and saved by the user.
+    """
+    required_surface = {
+        "assembly",
+        "h_inside_w_m2_k",
+        "h_outside_w_m2_k",
+    }
+
+    missing = required_surface - set(surface_df.columns)
+    if missing:
+        raise ValueError(
+            "Для поверхневого теплообміну відсутні колонки: "
+            + ", ".join(sorted(missing))
+        )
+
+    surface = surface_df.copy()
+
+    surface["assembly"] = (
+        surface["assembly"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    for col in [
+        "h_inside_w_m2_k",
+        "h_outside_w_m2_k",
+    ]:
+        surface[col] = pd.to_numeric(
+            surface[col],
+            errors="coerce",
+        )
+
+    merged = assemblies_df.merge(
+        surface,
+        on="assembly",
+        how="left",
+    )
+
+    invalid = (
+        merged["h_inside_w_m2_k"].isna()
+        | (merged["h_inside_w_m2_k"] <= 0)
+        | merged["h_outside_w_m2_k"].isna()
+        | (merged["h_outside_w_m2_k"] <= 0)
+    )
+
+    if invalid.any():
+        bad = merged.loc[
+            invalid,
+            "assembly",
+        ].astype(str).tolist()
+
+        raise ValueError(
+            "Для повного U потрібно підтвердити hвн>0 і hзовн>0 "
+            "для кожного вузла: "
+            + ", ".join(bad)
+        )
+
+    merged["r_inside_m2_k_w"] = (
+        1.0 / merged["h_inside_w_m2_k"]
+    )
+
+    merged["r_outside_m2_k_w"] = (
+        1.0 / merged["h_outside_w_m2_k"]
+    )
+
+    merged["r_total_m2_k_w"] = (
+        merged["r_inside_m2_k_w"]
+        + merged["r_layers_m2_k_w"]
+        + merged["r_outside_m2_k_w"]
+    )
+
+    merged["u_value_w_m2_k"] = (
+        1.0 / merged["r_total_m2_k_w"]
+    )
+
+    merged["ua_w_k"] = (
+        merged["area_m2"]
+        * merged["u_value_w_m2_k"]
+    )
+
+    return merged
+
+
+
+
 def calculate_transmission_heat_losses_stage21(
     coupled_profile: pd.DataFrame,
     zone_profile: pd.DataFrame,
@@ -4059,41 +4381,15 @@ def calculate_transmission_heat_losses_stage21(
     step_minutes: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | int]]:
     """
-    Пункт 21. Теплові втрати через огородження сушильної камери.
+    Пункт 21. Трансмісійні теплові втрати через огородження.
 
-    На цьому етапі враховуються лише трансмісійні теплові втрати
-    через корпус / двері / інші огороджувальні елементи:
+    envelope_df already contains the complete U-value calculated from:
+        R_total = 1/h_inside + R_layers + 1/h_outside
+        U = 1/R_total
 
-        Qdot_loss(t) = sum_j [U_j * A_j] * [T_ch(t) - T_amb(t)]
-
-    якщо T_ch > T_amb.
-
-    Для кожного елемента:
-        UA_j = U_j * A_j
-
-    Сумарно:
-        UA_sum = sum(UA_j)
-
-    Енергія втрат за часовий крок:
-        dQ_loss = Qdot_loss * dt
-
-    ВАЖЛИВО:
-    - тут НЕ враховуються втрати з відпрацьованим сушильним агентом;
-      вони належать до ентальпійного балансу повітря і будуть
-      пов'язані з рекуперацією на наступному етапі;
-    - тут НЕ враховується неконтрольована інфільтрація / витоки
-      через нещільності, якщо вони не визначені окремо;
-    - нічний режим не розраховується як активне сушіння. Його
-      мінімальна теплова потреба за умовою точки роси формується
-      окремо на відповідному етапі.
-
-    Репрезентативна температура всередині камери T_ch(t)
-    визначається з уже розрахованого зонального профілю:
-    для кожної зони береться середня
-        (T_air,in + T_air,out) / 2,
-    після чого усереднюється між зонами одного часового інтервалу.
+    Then:
+        Qdot_loss(t) = sum(U_j*A_j) * max(T_ch(t)-T_amb(t), 0)
     """
-    import numpy as np
 
     required_main = {
         "T2M",
@@ -4107,10 +4403,10 @@ def calculate_transmission_heat_losses_stage21(
     }
 
     required_env = {
-        "include",
-        "element",
+        "assembly",
         "area_m2",
         "u_value_w_m2_k",
+        "ua_w_k",
     }
 
     missing_main = required_main - set(coupled_profile.columns)
@@ -4131,7 +4427,7 @@ def calculate_transmission_heat_losses_stage21(
 
     if missing_env:
         raise ValueError(
-            "Для п.21 у таблиці огороджень відсутні колонки: "
+            "Для п.21 у таблиці огороджень відсутні параметри: "
             + ", ".join(sorted(missing_env))
         )
 
@@ -4142,67 +4438,38 @@ def calculate_transmission_heat_losses_stage21(
 
     env = envelope_df.copy()
 
-    env["include"] = (
-        env["include"]
-        .fillna(False)
-        .astype(bool)
-    )
-
-    env["area_m2"] = pd.to_numeric(
-        env["area_m2"],
-        errors="coerce",
-    )
-
-    env["u_value_w_m2_k"] = pd.to_numeric(
-        env["u_value_w_m2_k"],
-        errors="coerce",
-    )
-
-    active_env = env["include"]
-
-    if not active_env.any():
-        raise ValueError(
-            "Не вибрано жодного огороджувального елемента."
+    for col in [
+        "area_m2",
+        "u_value_w_m2_k",
+        "ua_w_k",
+    ]:
+        env[col] = pd.to_numeric(
+            env[col],
+            errors="coerce",
         )
 
     invalid = (
-        active_env
-        & (
-            env["area_m2"].isna()
-            | (env["area_m2"] <= 0)
-            | env["u_value_w_m2_k"].isna()
-            | (env["u_value_w_m2_k"] <= 0)
-        )
+        env["area_m2"].isna()
+        | (env["area_m2"] <= 0)
+        | env["u_value_w_m2_k"].isna()
+        | (env["u_value_w_m2_k"] <= 0)
+        | env["ua_w_k"].isna()
+        | (env["ua_w_k"] <= 0)
     )
 
     if invalid.any():
-        bad = (
-            env.loc[invalid, "element"]
-            .astype(str)
-            .tolist()
-        )
+        bad = env.loc[
+            invalid,
+            "assembly",
+        ].astype(str).tolist()
 
         raise ValueError(
-            "Для активних елементів A та U повинні бути "
-            "більшими за нуль: "
+            "Некоректні A, U або UA для вузлів: "
             + ", ".join(bad)
         )
 
-    env["ua_w_k"] = (
-        env["area_m2"]
-        * env["u_value_w_m2_k"]
-    )
-
-    env.loc[
-        ~env["include"],
-        "ua_w_k",
-    ] = 0.0
-
     total_area_m2 = float(
-        env.loc[
-            env["include"],
-            "area_m2",
-        ].sum()
+        env["area_m2"].sum()
     )
 
     total_ua_w_k = float(
@@ -4215,9 +4482,8 @@ def calculate_transmission_heat_losses_stage21(
         else float("nan")
     )
 
-    # -------------------------------------------------------------
-    # Representative internal chamber-air temperature by time step.
-    # -------------------------------------------------------------
+    # Representative chamber-air temperature from the already
+    # calculated zonal model.
     zones = zone_profile.copy()
 
     zones["air_inlet_temp_c"] = pd.to_numeric(
@@ -4245,8 +4511,6 @@ def calculate_transmission_heat_losses_stage21(
     )
 
     result = coupled_profile.copy()
-
-    # Preserve the chronological index and add a positional join key.
     result["time_position"] = range(len(result))
 
     temp_map = chamber_temp_by_time.to_dict()
@@ -4271,7 +4535,6 @@ def calculate_transmission_heat_losses_stage21(
         - result["heat_loss_ambient_temp_c"]
     )
 
-    # Positive values are losses from chamber to ambient.
     positive_delta_t = (
         result["heat_loss_delta_t_c"]
         .clip(lower=0.0)
@@ -4284,14 +4547,8 @@ def calculate_transmission_heat_losses_stage21(
     ).where(
         active,
         0.0,
-    )
+    ).fillna(0.0)
 
-    result["heat_loss_power_kw"] = (
-        result["heat_loss_power_kw"]
-        .fillna(0.0)
-    )
-
-    # Diagnostic heat gain if ambient is hotter than chamber.
     result["heat_gain_equivalent_kw"] = (
         total_ua_w_k
         * (
@@ -4320,8 +4577,9 @@ def calculate_transmission_heat_losses_stage21(
     ]
 
     total_heat_loss_kwh = float(
-        result["heat_loss_energy_kwh_interval"]
-        .sum()
+        result[
+            "heat_loss_energy_kwh_interval"
+        ].sum()
     )
 
     peak_heat_loss_kw = (
@@ -4363,16 +4621,6 @@ def calculate_transmission_heat_losses_stage21(
         * dt_h
     )
 
-    total_heat_gain_kwh = float(
-        (
-            result["heat_gain_equivalent_kw"]
-            * dt_h
-        ).sum()
-    )
-
-    # Contribution of each envelope element to total transmission
-    # loss. Because all elements see the same ΔT(t), shares are
-    # proportional to UA.
     if total_ua_w_k > 0:
         env["ua_share_pct"] = (
             env["ua_w_k"]
@@ -4389,38 +4637,15 @@ def calculate_transmission_heat_losses_stage21(
     )
 
     summary = {
-        "active_envelope_count": int(
-            env.loc[
-                env["include"]
-            ].shape[0]
-        ),
-        "total_envelope_area_m2": (
-            total_area_m2
-        ),
-        "total_ua_w_k": (
-            total_ua_w_k
-        ),
-        "area_weighted_u_w_m2_k": (
-            area_weighted_u
-        ),
-        "total_transmission_heat_loss_kwh": (
-            total_heat_loss_kwh
-        ),
-        "peak_transmission_heat_loss_kw": (
-            peak_heat_loss_kw
-        ),
-        "mean_transmission_heat_loss_kw": (
-            mean_heat_loss_kw
-        ),
-        "mean_loss_delta_t_c": (
-            mean_delta_t_c
-        ),
-        "active_heat_loss_hours": (
-            float(active_loss_hours)
-        ),
-        "total_heat_gain_equivalent_kwh": (
-            total_heat_gain_kwh
-        ),
+        "active_envelope_count": int(len(env)),
+        "total_envelope_area_m2": total_area_m2,
+        "total_ua_w_k": total_ua_w_k,
+        "area_weighted_u_w_m2_k": area_weighted_u,
+        "total_transmission_heat_loss_kwh": total_heat_loss_kwh,
+        "peak_transmission_heat_loss_kw": peak_heat_loss_kw,
+        "mean_transmission_heat_loss_kw": mean_heat_loss_kw,
+        "mean_loss_delta_t_c": mean_delta_t_c,
+        "active_heat_loss_hours": float(active_loss_hours),
     }
 
     return result, env, summary
@@ -4469,7 +4694,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "12. Нагрівання сушильного агента",
         "13. Випаровування вологи",
         "14. Нагрівання продукту",
-        "15. Теплова ємність конструкцій",
+        "15. Конструкція і теплоємність",
         "16. Теплові втрати",
     ]
 )
@@ -8362,243 +8587,108 @@ with tab_product_heating:
             )
 
 # ---------------------------------------------------------------------
-# 15. ТЕПЛОВА ЄМНІСТЬ КОНСТРУКЦІЙ СУШИЛЬНОЇ КАМЕРИ
+# 15. ТЕПЛОВА ЄМНІСТЬ І СКЛАД КОНСТРУКЦІЙ СУШИЛЬНОЇ КАМЕРИ
 # ---------------------------------------------------------------------
 with tab_construction_heating:
     st.subheader(
-        "Етап 20. Визначення теплової ємності конструкцій"
+        "Етап 20. Конструкція та теплова ємність сушильної камери"
     )
 
     st.info(
-        "У п.20 використовуються лише параметри, які можна "
-        "підтвердити за геометрією конструкції, специфікацією "
-        "або довідковими властивостями реально обраного матеріалу. "
-        "Невідома температура конструкції не задається."
+        "П.20 тепер є єдиним місцем, де описується конструкція "
+        "сушильної камери. Ті самі шари огородження автоматично "
+        "передаються в п.21 для розрахунку термічного опору та U. "
+        "Лотки, рама та інші внутрішні елементи впливають на "
+        "теплову ємність, але не входять у опір стінки."
     )
-
-    st.markdown("#### Розрахункова постановка")
 
     st.latex(
         r"m_i=\rho_i A_i\delta_i"
     )
 
     st.latex(
-        r"C_i=m_i c_{p,i}"
+        r"C_{\mathrm{констр}}=\sum_i m_i c_{p,i}"
+    )
+
+    st.write(
+        "Для шарів огородження додатково зберігається "
+        "теплопровідність λ, яка використовується вже в п.21:"
     )
 
     st.latex(
-        r"C_{\mathrm{констр}}"
-        r"=\sum_i m_i c_{p,i}"
-    )
-
-    st.caption(
-        "Cконстр — сумарна теплова ємність конструкції, кДж/К. "
-        "Вона показує, скільки теплоти потрібно для підвищення "
-        "температури врахованих конструктивних елементів на 1 К."
+        r"R_{\mathrm{шар},i}=\frac{\delta_i}{\lambda_i}"
     )
 
     st.warning(
-        "Фактична теплота на нагрівання Qконстр і потужність "
-        "Q̇констр на цьому етапі не визначаються, оскільки ще "
-        "немає розрахованої температури конструкції Tконстр(t). "
-        "Після формування нестаціонарного енергетичного балансу "
-        "буде використано dQконстр = Σ(mᵢcₚ,ᵢdTᵢ)."
+        "Кількість шарів повинна відповідати фактичній конструкції. "
+        "Другий металевий лист, двері або інша окрема ділянка "
+        "не додаються програмою автоматично. Якщо вони реально є, "
+        "їх потрібно описати тут."
     )
 
-    st.markdown(
-        "#### Спосіб задання конструктивних параметрів"
-    )
+    st.markdown("#### Введення конструкції")
 
     st.caption(
-        "Поля нижче об'єднані у форму. Під час введення чисел "
-        "програма не перераховується після кожної зміни. "
-        "Усі введені значення застосовуються лише після натискання "
-        "кнопки «Зберегти дані п.20». "
-        "Десятковий роздільник у Streamlit — крапка."
+        "Усі поля знаходяться у формі: зміни застосовуються лише "
+        "після натискання «Зберегти дані п.20». "
+        "Десятковий роздільник — крапка."
     )
 
     construction_mass_mode = st.radio(
-        "Оберіть спосіб визначення маси елементів",
+        "Спосіб визначення маси",
         options=[
-            "Ввести фактичну масу елементів",
             "Розрахувати масу за геометрією і густиною",
+            "Ввести фактичну масу елементів",
         ],
         index=0,
-        key="stage20_construction_mass_mode_v3",
+        key="stage20_construction_mass_mode_v4",
     )
 
     components20 = None
     stage20_saved_now = False
 
-    # -------------------------------------------------------------
-    # 20A. Direct mass input
-    # -------------------------------------------------------------
-    if construction_mass_mode == "Ввести фактичну масу елементів":
+    if "dryer_geometry" in st.session_state:
+        geometry20 = st.session_state["dryer_geometry"]
 
-        if (
-            "stage20_direct_components_verified_default"
-            not in st.session_state
-        ):
-            st.session_state[
-                "stage20_direct_components_verified_default"
-            ] = pd.DataFrame(
-                [
-                    {
-                        "include": False,
-                        "component": "Корпус / стінки",
-                        "mass_kg": 0.0,
-                        "cp_kj_kg_k": 0.0,
-                        "source_note": "",
-                    },
-                    {
-                        "include": False,
-                        "component": "Лотки",
-                        "mass_kg": 0.0,
-                        "cp_kj_kg_k": 0.0,
-                        "source_note": "",
-                    },
-                    {
-                        "include": False,
-                        "component": "Рама / опори",
-                        "mass_kg": 0.0,
-                        "cp_kj_kg_k": 0.0,
-                        "source_note": "",
-                    },
-                    {
-                        "include": False,
-                        "component": "Двері / інші елементи",
-                        "mass_kg": 0.0,
-                        "cp_kj_kg_k": 0.0,
-                        "source_note": "",
-                    },
-                ]
-            )
-
-        st.write(
-            "Цей режим використовується, якщо фактична маса "
-            "елемента відома зі специфікації, креслення або зважування."
+        chamber_l20 = float(
+            geometry20.get("chamber_length_m", 0.0)
+        )
+        chamber_w20 = float(
+            geometry20.get("chamber_width_m", 0.0)
+        )
+        chamber_h20 = float(
+            geometry20.get("chamber_height_m", 0.0)
         )
 
-        # If values were already saved earlier, show them again as the
-        # starting values of the form.
-        direct_form_source20 = st.session_state.get(
-            "stage20_saved_direct_components",
-            st.session_state[
-                "stage20_direct_components_verified_default"
-            ],
+        enclosure_area20 = (
+            2.0
+            * (
+                chamber_l20 * chamber_w20
+                + chamber_l20 * chamber_h20
+                + chamber_w20 * chamber_h20
+            )
         )
 
-        with st.form(
-            "stage20_direct_input_form",
-            clear_on_submit=False,
-        ):
-            construction_editor = st.data_editor(
-                direct_form_source20,
-                num_rows="dynamic",
-                width="stretch",
-                hide_index=True,
-                key="stage20_direct_components_editor_v3",
-                column_config={
-                    "include": st.column_config.CheckboxColumn(
-                        "Враховувати",
-                    ),
-                    "component": st.column_config.TextColumn(
-                        "Елемент",
-                    ),
-                    "mass_kg": st.column_config.NumberColumn(
-                        "m, кг",
-                        min_value=0.0,
-                        step=0.01,
-                        format="%.3f",
-                    ),
-                    "cp_kj_kg_k": st.column_config.NumberColumn(
-                        "cₚ, кДж/(кг·К)",
-                        min_value=0.0,
-                        step=0.001,
-                        format="%.3f",
-                    ),
-                    "source_note": st.column_config.TextColumn(
-                        "Джерело / примітка",
-                    ),
-                },
+        trays_area20 = float(
+            geometry20.get(
+                "total_drying_area_m2",
+                0.0,
             )
-
-            direct_submit20 = st.form_submit_button(
-                "Зберегти дані п.20",
-                type="primary",
-                use_container_width=True,
-            )
-
-        if direct_submit20:
-            st.session_state[
-                "stage20_saved_direct_components"
-            ] = construction_editor.copy()
-
-            st.session_state[
-                "stage20_saved_components_active"
-            ] = construction_editor.copy()
-
-            st.session_state[
-                "stage20_saved_mass_mode"
-            ] = construction_mass_mode
-
-            stage20_saved_now = True
-
-        if (
-            st.session_state.get(
-                "stage20_saved_mass_mode"
-            )
-            == construction_mass_mode
-            and "stage20_saved_direct_components"
-            in st.session_state
-        ):
-            components20 = st.session_state[
-                "stage20_saved_direct_components"
-            ].copy()
-
-    # -------------------------------------------------------------
-    # 20B. Geometry-based mass input
-    # -------------------------------------------------------------
+        )
     else:
+        enclosure_area20 = 0.0
+        trays_area20 = 0.0
+
+    if (
+        construction_mass_mode
+        == "Розрахувати масу за геометрією і густиною"
+    ):
         if "dryer_geometry" not in st.session_state:
             st.warning(
-                "Для цього режиму спочатку задайте геометрію "
-                "сушильної камери у вкладці 6."
+                "Спочатку задайте геометрію сушильної камери "
+                "у вкладці 6."
             )
-
         else:
-            geometry20 = st.session_state["dryer_geometry"]
-
-            chamber_l20 = float(
-                geometry20.get("chamber_length_m", 0.0)
-            )
-            chamber_w20 = float(
-                geometry20.get("chamber_width_m", 0.0)
-            )
-            chamber_h20 = float(
-                geometry20.get("chamber_height_m", 0.0)
-            )
-
-            enclosure_area20 = (
-                2.0
-                * (
-                    chamber_l20 * chamber_w20
-                    + chamber_l20 * chamber_h20
-                    + chamber_w20 * chamber_h20
-                )
-            )
-
-            trays_area20 = float(
-                geometry20.get(
-                    "total_drying_area_m2",
-                    0.0,
-                )
-            )
-
-            st.write(
-                "Із уже заданої геометрії отримано:"
-            )
-
             g1, g2 = st.columns(2)
 
             g1.metric(
@@ -8611,69 +8701,84 @@ with tab_construction_heating:
                 f"{trays_area20:.3f} м²",
             )
 
-            st.caption(
-                "Ці площі є результатом попередньо заданої геометрії. "
-                "Якщо реальна площа матеріалу відрізняється через "
-                "перфорацію, отвори, двері або неповне покриття, "
-                "введіть фактичну площу."
+            default_geometry20 = pd.DataFrame(
+                [
+                    {
+                        "include": False,
+                        "element_role": "Шар огородження",
+                        "assembly": "Основне огородження",
+                        "component": "Внутрішній матеріальний шар",
+                        "area_m2": enclosure_area20,
+                        "thickness_mm": 0.0,
+                        "density_kg_m3": 0.0,
+                        "cp_kj_kg_k": 0.0,
+                        "thermal_conductivity_w_m_k": 0.0,
+                        "source_note": "",
+                    },
+                    {
+                        "include": False,
+                        "element_role": "Шар огородження",
+                        "assembly": "Основне огородження",
+                        "component": "Теплоізоляція",
+                        "area_m2": enclosure_area20,
+                        "thickness_mm": 0.0,
+                        "density_kg_m3": 0.0,
+                        "cp_kj_kg_k": 0.0,
+                        "thermal_conductivity_w_m_k": 0.0,
+                        "source_note": "",
+                    },
+                    {
+                        "include": False,
+                        "element_role": "Шар огородження",
+                        "assembly": "Основне огородження",
+                        "component": "Зовнішній матеріальний шар",
+                        "area_m2": enclosure_area20,
+                        "thickness_mm": 0.0,
+                        "density_kg_m3": 0.0,
+                        "cp_kj_kg_k": 0.0,
+                        "thermal_conductivity_w_m_k": 0.0,
+                        "source_note": "",
+                    },
+                    {
+                        "include": False,
+                        "element_role": "Внутрішній елемент",
+                        "assembly": "",
+                        "component": "Лотки",
+                        "area_m2": trays_area20,
+                        "thickness_mm": 0.0,
+                        "density_kg_m3": 0.0,
+                        "cp_kj_kg_k": 0.0,
+                        "thermal_conductivity_w_m_k": 0.0,
+                        "source_note": "",
+                    },
+                    {
+                        "include": False,
+                        "element_role": "Внутрішній елемент",
+                        "assembly": "",
+                        "component": "Рама / інше",
+                        "area_m2": 0.0,
+                        "thickness_mm": 0.0,
+                        "density_kg_m3": 0.0,
+                        "cp_kj_kg_k": 0.0,
+                        "thermal_conductivity_w_m_k": 0.0,
+                        "source_note": "",
+                    },
+                ]
             )
 
-            if (
-                "stage20_geometry_components_verified_default"
-                not in st.session_state
-            ):
-                st.session_state[
-                    "stage20_geometry_components_verified_default"
-                ] = pd.DataFrame(
-                    [
-                        {
-                            "include": False,
-                            "component": "Корпус — матеріальний шар",
-                            "area_m2": enclosure_area20,
-                            "thickness_mm": 0.0,
-                            "density_kg_m3": 0.0,
-                            "cp_kj_kg_k": 0.0,
-                            "source_note": "",
-                        },
-                        {
-                            "include": False,
-                            "component": "Теплоізоляція",
-                            "area_m2": enclosure_area20,
-                            "thickness_mm": 0.0,
-                            "density_kg_m3": 0.0,
-                            "cp_kj_kg_k": 0.0,
-                            "source_note": "",
-                        },
-                        {
-                            "include": False,
-                            "component": "Лотки",
-                            "area_m2": trays_area20,
-                            "thickness_mm": 0.0,
-                            "density_kg_m3": 0.0,
-                            "cp_kj_kg_k": 0.0,
-                            "source_note": "",
-                        },
-                        {
-                            "include": False,
-                            "component": "Рама / інше",
-                            "area_m2": 0.0,
-                            "thickness_mm": 0.0,
-                            "density_kg_m3": 0.0,
-                            "cp_kj_kg_k": 0.0,
-                            "source_note": "",
-                        },
-                    ]
-                )
-
-            geometry_form_source20 = st.session_state.get(
+            old_geometry20 = st.session_state.get(
                 "stage20_saved_geometry_components_raw",
-                st.session_state[
-                    "stage20_geometry_components_verified_default"
-                ],
+                default_geometry20,
+            )
+
+            geometry_form_source20 = (
+                upgrade_stage20_components_for_linkage(
+                    old_geometry20
+                )
             )
 
             with st.form(
-                "stage20_geometry_input_form",
+                "stage20_geometry_input_form_v4",
                 clear_on_submit=False,
             ):
                 geometry_editor20 = st.data_editor(
@@ -8681,10 +8786,26 @@ with tab_construction_heating:
                     num_rows="dynamic",
                     width="stretch",
                     hide_index=True,
-                    key="stage20_geometry_components_editor_v3",
+                    key="stage20_geometry_components_editor_v4",
                     column_config={
                         "include": st.column_config.CheckboxColumn(
                             "Враховувати",
+                        ),
+                        "element_role": st.column_config.SelectboxColumn(
+                            "Роль елемента",
+                            options=[
+                                "Шар огородження",
+                                "Внутрішній елемент",
+                            ],
+                            required=True,
+                        ),
+                        "assembly": st.column_config.TextColumn(
+                            "Вузол огородження",
+                            help=(
+                                "Для послідовних шарів однієї стінки "
+                                "вкажіть однакову назву. Окремі двері "
+                                "задавайте окремим вузлом."
+                            ),
                         ),
                         "component": st.column_config.TextColumn(
                             "Елемент / матеріал",
@@ -8713,6 +8834,19 @@ with tab_construction_heating:
                             step=0.001,
                             format="%.3f",
                         ),
+                        "thermal_conductivity_w_m_k": (
+                            st.column_config.NumberColumn(
+                                "λ, Вт/(м·К)",
+                                min_value=0.0,
+                                step=0.001,
+                                format="%.4f",
+                                help=(
+                                    "Потрібна для шарів огородження "
+                                    "у п.21. Для лотків/рами може "
+                                    "залишатися 0."
+                                ),
+                            )
+                        ),
                         "source_note": st.column_config.TextColumn(
                             "Джерело / примітка",
                         ),
@@ -8726,9 +8860,12 @@ with tab_construction_heating:
                 )
 
             if geometry_submit20:
-                geometry_saved20 = geometry_editor20.copy()
+                geometry_saved20 = (
+                    upgrade_stage20_components_for_linkage(
+                        geometry_editor20
+                    )
+                )
 
-                # Mass is calculated only after the user submits the form.
                 geometry_saved20["mass_kg"] = (
                     pd.to_numeric(
                         geometry_saved20["area_m2"],
@@ -8773,37 +8910,168 @@ with tab_construction_heating:
                 and "stage20_saved_geometry_components"
                 in st.session_state
             ):
-                components20 = st.session_state[
-                    "stage20_saved_geometry_components"
-                ].copy()
-
-                st.write(
-                    "Маса, розрахована після останнього збереження:"
-                )
-
-                st.dataframe(
-                    components20[
-                        [
-                            "include",
-                            "component",
-                            "mass_kg",
-                            "source_note",
+                components20 = (
+                    upgrade_stage20_components_for_linkage(
+                        st.session_state[
+                            "stage20_saved_geometry_components"
                         ]
-                    ],
-                    width="stretch",
-                    hide_index=True,
+                    )
                 )
+
+    else:
+        default_direct20 = pd.DataFrame(
+            [
+                {
+                    "include": False,
+                    "element_role": "Внутрішній елемент",
+                    "assembly": "",
+                    "component": "Елемент",
+                    "mass_kg": 0.0,
+                    "cp_kj_kg_k": 0.0,
+                    "area_m2": 0.0,
+                    "thickness_mm": 0.0,
+                    "thermal_conductivity_w_m_k": 0.0,
+                    "source_note": "",
+                },
+            ]
+        )
+
+        old_direct20 = st.session_state.get(
+            "stage20_saved_direct_components",
+            default_direct20,
+        )
+
+        direct_form_source20 = (
+            upgrade_stage20_components_for_linkage(
+                old_direct20
+            )
+        )
+
+        st.caption(
+            "Якщо елемент є шаром огородження, для зв'язку з п.21 "
+            "потрібно також вказати A, δ і λ. Для внутрішніх елементів "
+            "ці поля можуть залишатися нульовими."
+        )
+
+        with st.form(
+            "stage20_direct_input_form_v4",
+            clear_on_submit=False,
+        ):
+            direct_editor20 = st.data_editor(
+                direct_form_source20,
+                num_rows="dynamic",
+                width="stretch",
+                hide_index=True,
+                key="stage20_direct_components_editor_v4",
+                column_config={
+                    "include": st.column_config.CheckboxColumn(
+                        "Враховувати",
+                    ),
+                    "element_role": st.column_config.SelectboxColumn(
+                        "Роль елемента",
+                        options=[
+                            "Шар огородження",
+                            "Внутрішній елемент",
+                        ],
+                        required=True,
+                    ),
+                    "assembly": st.column_config.TextColumn(
+                        "Вузол огородження",
+                    ),
+                    "component": st.column_config.TextColumn(
+                        "Елемент / матеріал",
+                    ),
+                    "mass_kg": st.column_config.NumberColumn(
+                        "m, кг",
+                        min_value=0.0,
+                        step=0.01,
+                        format="%.3f",
+                    ),
+                    "cp_kj_kg_k": st.column_config.NumberColumn(
+                        "cₚ, кДж/(кг·К)",
+                        min_value=0.0,
+                        step=0.001,
+                        format="%.3f",
+                    ),
+                    "area_m2": st.column_config.NumberColumn(
+                        "A, м²",
+                        min_value=0.0,
+                        step=0.01,
+                        format="%.3f",
+                    ),
+                    "thickness_mm": st.column_config.NumberColumn(
+                        "δ, мм",
+                        min_value=0.0,
+                        step=0.01,
+                        format="%.2f",
+                    ),
+                    "thermal_conductivity_w_m_k": (
+                        st.column_config.NumberColumn(
+                            "λ, Вт/(м·К)",
+                            min_value=0.0,
+                            step=0.001,
+                            format="%.4f",
+                        )
+                    ),
+                    "source_note": st.column_config.TextColumn(
+                        "Джерело / примітка",
+                    ),
+                },
+            )
+
+            direct_submit20 = st.form_submit_button(
+                "Зберегти дані п.20",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if direct_submit20:
+            direct_saved20 = (
+                upgrade_stage20_components_for_linkage(
+                    direct_editor20
+                )
+            )
+
+            st.session_state[
+                "stage20_saved_direct_components"
+            ] = direct_saved20.copy()
+
+            st.session_state[
+                "stage20_saved_components_active"
+            ] = direct_saved20.copy()
+
+            st.session_state[
+                "stage20_saved_mass_mode"
+            ] = construction_mass_mode
+
+            stage20_saved_now = True
+
+        if (
+            st.session_state.get(
+                "stage20_saved_mass_mode"
+            )
+            == construction_mass_mode
+            and "stage20_saved_direct_components"
+            in st.session_state
+        ):
+            components20 = (
+                upgrade_stage20_components_for_linkage(
+                    st.session_state[
+                        "stage20_saved_direct_components"
+                    ]
+                )
+            )
 
     if stage20_saved_now:
         st.success(
-            "Дані п.20 збережено. Розрахунок оновлено."
+            "Дані п.20 збережено. П.21 автоматично використовуватиме "
+            "ті самі активні шари огородження."
         )
 
     if components20 is None:
         st.info(
-            "Заповніть усі потрібні поля та натисніть "
-            "«Зберегти дані п.20». До цього моменту введення "
-            "не запускає розрахунок."
+            "Заповніть потрібні поля та натисніть "
+            "«Зберегти дані п.20»."
         )
 
     else:
@@ -8846,7 +9114,7 @@ with tab_construction_heating:
             )
 
             c3.metric(
-                "На підвищення температури на 1 К",
+                "Теплова ємність",
                 (
                     f"{construction_summary20['energy_per_1k_kwh']:.4f} "
                     "кВт·год/К"
@@ -8861,46 +9129,21 @@ with tab_construction_heating:
                 ),
             )
 
-            st.write(
-                "Найбільший внесок у теплову ємність: "
-                f"**{construction_summary20['dominant_component']}** "
-                f"({construction_summary20['dominant_share_pct']:.1f} %)."
-            )
-
             st.markdown(
-                "#### Внесок елементів у теплову ємність"
+                "#### Збережені елементи конструкції"
             )
-
-            capacity_chart20 = (
-                construction_result20.loc[
-                    construction_result20["include"],
-                    [
-                        "component",
-                        "thermal_capacity_kj_k",
-                    ],
-                ]
-                .set_index("component")
-                .rename(
-                    columns={
-                        "thermal_capacity_kj_k": "Cᵢ, кДж/К"
-                    }
-                )
-            )
-
-            st.bar_chart(
-                capacity_chart20,
-                width="stretch",
-            )
-
-            st.markdown("#### Деталізація")
 
             display_cols20 = [
+                "element_role",
+                "assembly",
                 "component",
+                "area_m2",
+                "thickness_mm",
                 "mass_kg",
+                "density_kg_m3",
                 "cp_kj_kg_k",
+                "thermal_conductivity_w_m_k",
                 "thermal_capacity_kj_k",
-                "energy_per_1k_kwh",
-                "capacity_share_pct",
                 "source_note",
             ]
 
@@ -8919,22 +9162,66 @@ with tab_construction_heating:
                 hide_index=True,
             )
 
-            st.success(
-                "Результати нижче відповідають останньому "
-                "збереженому набору параметрів п.20."
-            )
+            try:
+                (
+                    envelope_layers20,
+                    envelope_assemblies20,
+                ) = build_envelope_assemblies_stage21(
+                    construction_result20
+                )
+
+            except Exception as exc:
+                st.info(
+                    "Теплова ємність п.20 розрахована. "
+                    "Для автоматичного переходу до п.21: "
+                    + str(exc)
+                )
+
+            else:
+                st.session_state[
+                    "stage20_envelope_layers"
+                ] = envelope_layers20
+
+                st.session_state[
+                    "stage20_envelope_assemblies"
+                ] = envelope_assemblies20
+
+                st.markdown(
+                    "#### Що автоматично передається в п.21"
+                )
+
+                st.dataframe(
+                    envelope_assemblies20[
+                        [
+                            "assembly",
+                            "area_m2",
+                            "layer_count",
+                            "r_layers_m2_k_w",
+                            "u_layers_w_m2_k",
+                        ]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+
+                st.caption(
+                    "1/Rшарів показано лише як характеристику "
+                    "теплопровідності пакета шарів. Це ще не повний "
+                    "U від внутрішнього повітря до зовнішнього, "
+                    "бо поверхневі опори не включені."
+                )
 
             st.download_button(
-                "Завантажити теплову ємність конструкцій",
+                "Завантажити дані конструкції",
                 data=dataframe_to_csv_bytes(
                     construction_result20
                 ),
                 file_name=(
-                    "stage20_construction_thermal_capacity.csv"
+                    "stage20_construction_and_capacity.csv"
                 ),
                 mime="text/csv",
                 width="stretch",
-                key="download_stage20_capacity",
+                key="download_stage20_capacity_v4",
             )
 
 # ---------------------------------------------------------------------
@@ -8946,427 +9233,449 @@ with tab_heat_losses:
     )
 
     st.info(
-        "На цьому етапі визначаються трансмісійні теплові "
-        "втрати через огородження сушильної камери під час "
-        "активного сушіння. Втрати з відпрацьованим повітрям "
-        "тут не додаються: вони належать до ентальпійного "
-        "балансу сушильного агента і будуть пов'язані з "
-        "рекуперацією на наступному етапі."
+        "П.21 більше не має окремої таблиці стін, дверей або U. "
+        "Геометрія та всі матеріальні шари автоматично беруться "
+        "з останнього збереженого набору п.20."
     )
 
-    st.markdown(
-        "#### Теплопередача через огородження"
+    st.latex(
+        r"R_{\mathrm{шарів},j}"
+        r"=\sum_i\frac{\delta_{i,j}}{\lambda_{i,j}}"
+    )
+
+    st.latex(
+        r"U_j="
+        r"\left("
+        r"\frac{1}{h_{\mathrm{вн},j}}"
+        r"+R_{\mathrm{шарів},j}"
+        r"+\frac{1}{h_{\mathrm{зовн},j}}"
+        r"\right)^{-1}"
     )
 
     st.latex(
         r"\dot Q_{\mathrm{втр}}(t)"
-        r"=\sum_j U_j A_j"
+        r"=\sum_j U_jA_j"
         r"\left[T_{\mathrm{кам}}(t)-T_{\mathrm{зовн}}(t)\right]"
     )
 
-    st.write(
-        "Для багатошарової конструкції коефіцієнт теплопередачі "
-        "може бути попередньо визначений через сумарний "
-        "термічний опір:"
-    )
-
-    st.latex(
-        r"U="
-        r"\left("
-        r"R_{\mathrm{si}}"
-        r"+\sum_k\frac{\delta_k}{\lambda_k}"
-        r"+R_{\mathrm{se}}"
-        r"\right)^{-1}"
-    )
-
-    st.caption(
-        "U — коефіцієнт теплопередачі огородження, Вт/(м²·К); "
-        "A — площа огородження; Tкам — репрезентативна "
-        "температура повітря в камері; Tзовн — температура "
-        "зовнішнього повітря."
-    )
-
     st.warning(
-        "U не задається програмою довільно. Для п.21 потрібно "
-        "ввести розраховане або довідкове значення U для "
-        "реально обраної конструкції. У поточній версії "
-        "не враховуються неконтрольовані витоки повітря через "
-        "нещільності та теплові мости."
+        "hвн та hзовн не підставляються програмою довільно. "
+        "Поки ці коефіцієнти не розраховані або не підтверджені, "
+        "модель показує лише опір матеріальних шарів Rшарів "
+        "і не видає остаточні теплові втрати."
     )
 
-    if "coupled_drying_profile" not in st.session_state:
+    if (
+        "construction_thermal_capacity_components"
+        not in st.session_state
+    ):
         st.warning(
-            "Спочатку виконайте етап 15."
+            "Спочатку збережіть конструкцію у п.20."
+        )
+
+    elif "coupled_drying_profile" not in st.session_state:
+        st.warning(
+            "Спочатку виконайте спільний розрахунок сушіння."
         )
 
     elif "coupled_drying_zone_profile" not in st.session_state:
         st.warning(
-            "Для визначення температури всередині камери "
-            "потрібен зональний профіль з етапу 15."
-        )
-
-    elif "dryer_geometry" not in st.session_state:
-        st.warning(
-            "Спочатку задайте геометрію сушильної камери."
+            "Для температури камери потрібен зональний профіль."
         )
 
     else:
-        heatloss21_main = st.session_state[
-            "coupled_drying_profile"
-        ]
-
-        heatloss21_zones = st.session_state[
-            "coupled_drying_zone_profile"
-        ]
-
-        geometry21 = st.session_state[
-            "dryer_geometry"
-        ]
-
-        chamber_l21 = float(
-            geometry21.get(
-                "chamber_length_m",
-                0.0,
-            )
-        )
-
-        chamber_w21 = float(
-            geometry21.get(
-                "chamber_width_m",
-                0.0,
-            )
-        )
-
-        chamber_h21 = float(
-            geometry21.get(
-                "chamber_height_m",
-                0.0,
-            )
-        )
-
-        gross_enclosure_area21 = (
-            2.0
-            * (
-                chamber_l21 * chamber_w21
-                + chamber_l21 * chamber_h21
-                + chamber_w21 * chamber_h21
-            )
-        )
-
-        st.write(
-            "Геометрична площа всіх шести поверхонь камери:"
-        )
-
-        st.metric(
-            "Aогородж",
-            f"{gross_enclosure_area21:.3f} м²",
-        )
-
-        st.caption(
-            "Якщо підлога, двері або окремі поверхні мають "
-            "іншу конструкцію, їх доцільно винести в окремі "
-            "рядки, а площу основного огородження відповідно "
-            "зменшити."
-        )
-
-        if (
-            "stage21_envelope_default"
-            not in st.session_state
-        ):
+        construction21 = (
             st.session_state[
-                "stage21_envelope_default"
-            ] = pd.DataFrame(
-                [
-                    {
-                        "include": False,
-                        "element": "Основне огородження камери",
-                        "area_m2": gross_enclosure_area21,
-                        "u_value_w_m2_k": 0.0,
-                    },
-                    {
-                        "include": False,
-                        "element": "Двері / люк",
-                        "area_m2": 0.0,
-                        "u_value_w_m2_k": 0.0,
-                    },
-                    {
-                        "include": False,
-                        "element": "Інша ділянка",
-                        "area_m2": 0.0,
-                        "u_value_w_m2_k": 0.0,
-                    },
-                ]
-            )
-
-        st.markdown(
-            "#### Огороджувальні елементи"
-        )
-
-        st.caption(
-            "Увімкніть потрібні рядки та введіть площу A і "
-            "коефіцієнт теплопередачі U. Десятковий роздільник "
-            "у числових полях — крапка."
-        )
-
-        envelope_editor21 = st.data_editor(
-            st.session_state[
-                "stage21_envelope_default"
-            ],
-            num_rows="dynamic",
-            width="stretch",
-            hide_index=True,
-            key="stage21_envelope_editor",
-            column_config={
-                "include": st.column_config.CheckboxColumn(
-                    "Враховувати",
-                ),
-                "element": st.column_config.TextColumn(
-                    "Огородження",
-                ),
-                "area_m2": st.column_config.NumberColumn(
-                    "A, м²",
-                    min_value=0.0,
-                    step=0.01,
-                    format="%.3f",
-                ),
-                "u_value_w_m2_k": st.column_config.NumberColumn(
-                    "U, Вт/(м²·К)",
-                    min_value=0.0,
-                    step=0.001,
-                    format="%.3f",
-                ),
-            },
+                "construction_thermal_capacity_components"
+            ]
         )
 
         try:
             (
-                heat_loss_profile21,
-                heat_loss_envelope21,
-                heat_loss_summary21,
-            ) = calculate_transmission_heat_losses_stage21(
-                coupled_profile=heatloss21_main,
-                zone_profile=heatloss21_zones,
-                envelope_df=envelope_editor21,
-                step_minutes=int(model_step_minutes),
+                envelope_layers21,
+                envelope_assemblies21,
+            ) = build_envelope_assemblies_stage21(
+                construction21
             )
 
         except Exception as exc:
             st.warning(str(exc))
 
         else:
-            st.session_state[
-                "heat_loss_profile"
-            ] = heat_loss_profile21
-
-            st.session_state[
-                "heat_loss_envelope"
-            ] = heat_loss_envelope21
-
-            st.session_state[
-                "heat_loss_summary"
-            ] = heat_loss_summary21
-
-            h1, h2, h3, h4 = st.columns(4)
-
-            h1.metric(
-                "ΣUA",
-                (
-                    f"{heat_loss_summary21['total_ua_w_k']:.2f} "
-                    "Вт/К"
-                ),
-            )
-
-            h2.metric(
-                "Середній U",
-                (
-                    f"{heat_loss_summary21['area_weighted_u_w_m2_k']:.3f} "
-                    "Вт/(м²·К)"
-                ),
-            )
-
-            h3.metric(
-                "Пікові теплові втрати",
-                (
-                    f"{heat_loss_summary21['peak_transmission_heat_loss_kw']:.3f} "
-                    "кВт"
-                ),
-            )
-
-            h4.metric(
-                "Теплова енергія втрат",
-                (
-                    f"{heat_loss_summary21['total_transmission_heat_loss_kwh']:.3f} "
-                    "кВт·год"
-                ),
-            )
-
-            h5, h6, h7 = st.columns(3)
-
-            h5.metric(
-                "Середні теплові втрати",
-                (
-                    f"{heat_loss_summary21['mean_transmission_heat_loss_kw']:.3f} "
-                    "кВт"
-                ),
-            )
-
-            h6.metric(
-                "Середній ΔT",
-                (
-                    f"{heat_loss_summary21['mean_loss_delta_t_c']:.2f} "
-                    "°C"
-                ),
-            )
-
-            h7.metric(
-                "Активний час втрат",
-                (
-                    f"{heat_loss_summary21['active_heat_loss_hours']:.2f} "
-                    "год"
-                ),
-            )
-
-            st.success(
-                "Репрезентативна температура камери для п.21 "
-                "не задається вручну: вона автоматично отримується "
-                "з температур входу і виходу зон у п.15."
-            )
-
             st.markdown(
-                "#### Температурний напір"
-            )
-
-            temp_chart21 = heat_loss_profile21[
-                [
-                    "heat_loss_chamber_temp_c",
-                    "heat_loss_ambient_temp_c",
-                ]
-            ].rename(
-                columns={
-                    "heat_loss_chamber_temp_c": (
-                        "T камери, °C"
-                    ),
-                    "heat_loss_ambient_temp_c": (
-                        "T зовнішнього повітря, °C"
-                    ),
-                }
-            )
-
-            st.line_chart(
-                temp_chart21,
-                width="stretch",
-            )
-
-            st.markdown(
-                "#### Теплова потужність втрат"
-            )
-
-            st.line_chart(
-                heat_loss_profile21[
-                    ["heat_loss_power_kw"]
-                ].rename(
-                    columns={
-                        "heat_loss_power_kw": (
-                            "Q̇втр, кВт"
-                        )
-                    }
-                ),
-                width="stretch",
-            )
-
-            st.markdown(
-                "#### Накопичена теплова енергія втрат"
-            )
-
-            st.line_chart(
-                heat_loss_profile21[
-                    ["heat_loss_energy_kwh_cumulative"]
-                ].rename(
-                    columns={
-                        "heat_loss_energy_kwh_cumulative": (
-                            "Qвтр,Σ, кВт·год"
-                        )
-                    }
-                ),
-                width="stretch",
-            )
-
-            st.markdown(
-                "#### Внесок огороджувальних елементів"
+                "#### Шари, автоматично отримані з п.20"
             )
 
             st.dataframe(
-                heat_loss_envelope21.loc[
-                    heat_loss_envelope21["include"],
+                envelope_layers21[
                     [
-                        "element",
+                        "assembly",
+                        "component",
                         "area_m2",
-                        "u_value_w_m2_k",
-                        "ua_w_k",
-                        "ua_share_pct",
-                        "estimated_loss_energy_kwh",
-                    ],
+                        "thickness_mm",
+                        "thermal_conductivity_w_m_k",
+                        "layer_resistance_m2_k_w",
+                        "source_note",
+                    ]
                 ],
                 width="stretch",
                 hide_index=True,
             )
 
-            if "air_heating_summary" in st.session_state:
-                air_heat21 = float(
-                    st.session_state[
-                        "air_heating_summary"
-                    ][
-                        "total_air_heating_energy_kwh"
+            st.markdown(
+                "#### Термічний опір матеріальних шарів"
+            )
+
+            st.dataframe(
+                envelope_assemblies21[
+                    [
+                        "assembly",
+                        "area_m2",
+                        "layer_count",
+                        "r_layers_m2_k_w",
+                        "u_layers_w_m2_k",
                     ]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.caption(
+                "Uшарів = 1/Rшарів не використовується як повний U "
+                "у формулі втрат за температурами повітря, оскільки "
+                "ще відсутні внутрішній та зовнішній поверхневі опори."
+            )
+
+            default_surface21 = pd.DataFrame(
+                {
+                    "assembly": envelope_assemblies21[
+                        "assembly"
+                    ].tolist(),
+                    "h_inside_w_m2_k": [0.0]
+                    * len(envelope_assemblies21),
+                    "h_outside_w_m2_k": [0.0]
+                    * len(envelope_assemblies21),
+                    "source_note": [""]
+                    * len(envelope_assemblies21),
+                }
+            )
+
+            saved_surface21 = st.session_state.get(
+                "stage21_saved_surface_coefficients",
+                None,
+            )
+
+            if saved_surface21 is not None:
+                old_surface = saved_surface21.copy()
+
+                # Keep previously saved h-values only for assemblies
+                # that still exist in stage 20.
+                surface_form_source21 = (
+                    default_surface21.drop(
+                        columns=[
+                            "h_inside_w_m2_k",
+                            "h_outside_w_m2_k",
+                            "source_note",
+                        ]
+                    )
+                    .merge(
+                        old_surface,
+                        on="assembly",
+                        how="left",
+                    )
                 )
 
-                loss21 = float(
-                    heat_loss_summary21[
-                        "total_transmission_heat_loss_kwh"
-                    ]
+                for col in [
+                    "h_inside_w_m2_k",
+                    "h_outside_w_m2_k",
+                ]:
+                    surface_form_source21[col] = (
+                        pd.to_numeric(
+                            surface_form_source21[col],
+                            errors="coerce",
+                        ).fillna(0.0)
+                    )
+
+                surface_form_source21["source_note"] = (
+                    surface_form_source21[
+                        "source_note"
+                    ].fillna("")
+                )
+            else:
+                surface_form_source21 = (
+                    default_surface21
                 )
 
-                if air_heat21 > 0:
-                    loss_to_air_heating_pct = (
-                        loss21 / air_heat21 * 100.0
+            st.markdown(
+                "#### Поверхневий теплообмін"
+            )
+
+            st.caption(
+                "Введіть hвн та hзовн лише після їх розрахунку "
+                "або обґрунтованого вибору. Значення застосуються "
+                "тільки після натискання кнопки збереження."
+            )
+
+            with st.form(
+                "stage21_surface_coefficients_form",
+                clear_on_submit=False,
+            ):
+                surface_editor21 = st.data_editor(
+                    surface_form_source21,
+                    width="stretch",
+                    hide_index=True,
+                    disabled=["assembly"],
+                    key="stage21_surface_editor",
+                    column_config={
+                        "assembly": st.column_config.TextColumn(
+                            "Вузол",
+                        ),
+                        "h_inside_w_m2_k": (
+                            st.column_config.NumberColumn(
+                                "hвн, Вт/(м²·К)",
+                                min_value=0.0,
+                                step=0.01,
+                                format="%.3f",
+                            )
+                        ),
+                        "h_outside_w_m2_k": (
+                            st.column_config.NumberColumn(
+                                "hзовн, Вт/(м²·К)",
+                                min_value=0.0,
+                                step=0.01,
+                                format="%.3f",
+                            )
+                        ),
+                        "source_note": st.column_config.TextColumn(
+                            "Джерело / примітка",
+                        ),
+                    },
+                )
+
+                surface_submit21 = st.form_submit_button(
+                    "Зберегти коефіцієнти теплообміну п.21",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if surface_submit21:
+                st.session_state[
+                    "stage21_saved_surface_coefficients"
+                ] = surface_editor21.copy()
+
+                st.success(
+                    "Коефіцієнти теплообміну збережено."
+                )
+
+            if (
+                "stage21_saved_surface_coefficients"
+                not in st.session_state
+            ):
+                st.info(
+                    "Матеріальні шари вже узгоджені з п.20. "
+                    "Остаточний U і теплові втрати з'являться після "
+                    "підтвердження hвн та hзовн."
+                )
+
+            else:
+                try:
+                    envelope_full21 = (
+                        apply_surface_resistances_stage21(
+                            envelope_assemblies21,
+                            st.session_state[
+                                "stage21_saved_surface_coefficients"
+                            ],
+                        )
                     )
 
-                    st.write(
-                        "Трансмісійні втрати становлять "
-                        f"**{loss_to_air_heating_pct:.1f} %** "
-                        "від уже розрахованої енергії на "
-                        "нагрівання сушильного агента у п.17."
+                except Exception as exc:
+                    st.warning(str(exc))
+
+                else:
+                    st.markdown(
+                        "#### Розрахований коефіцієнт теплопередачі"
                     )
 
-            st.download_button(
-                "Завантажити часовий ряд теплових втрат",
-                data=dataframe_to_csv_bytes(
-                    heat_loss_profile21
-                ),
-                file_name=(
-                    "stage21_transmission_heat_losses.csv"
-                ),
-                mime="text/csv",
-                width="stretch",
-                key="download_stage21_heat_losses",
-            )
+                    st.dataframe(
+                        envelope_full21[
+                            [
+                                "assembly",
+                                "area_m2",
+                                "r_layers_m2_k_w",
+                                "h_inside_w_m2_k",
+                                "r_inside_m2_k_w",
+                                "h_outside_w_m2_k",
+                                "r_outside_m2_k_w",
+                                "r_total_m2_k_w",
+                                "u_value_w_m2_k",
+                                "ua_w_k",
+                                "source_note",
+                            ]
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
 
-            st.download_button(
-                "Завантажити параметри огороджень",
-                data=dataframe_to_csv_bytes(
-                    heat_loss_envelope21
-                ),
-                file_name=(
-                    "stage21_envelope_parameters.csv"
-                ),
-                mime="text/csv",
-                width="stretch",
-                key="download_stage21_envelope",
-            )
+                    try:
+                        (
+                            heat_loss_profile21,
+                            heat_loss_envelope21,
+                            heat_loss_summary21,
+                        ) = calculate_transmission_heat_losses_stage21(
+                            coupled_profile=st.session_state[
+                                "coupled_drying_profile"
+                            ],
+                            zone_profile=st.session_state[
+                                "coupled_drying_zone_profile"
+                            ],
+                            envelope_df=envelope_full21,
+                            step_minutes=int(
+                                model_step_minutes
+                            ),
+                        )
 
-            st.info(
-                "Наступний етап — пункт 22: урахування "
-                "рекуперації теплоти відпрацьованого "
-                "сушильного агента."
-            )
+                    except Exception as exc:
+                        st.warning(str(exc))
 
+                    else:
+                        st.session_state[
+                            "heat_loss_profile"
+                        ] = heat_loss_profile21
+
+                        st.session_state[
+                            "heat_loss_envelope"
+                        ] = heat_loss_envelope21
+
+                        st.session_state[
+                            "heat_loss_summary"
+                        ] = heat_loss_summary21
+
+                        h1, h2, h3, h4 = st.columns(4)
+
+                        h1.metric(
+                            "ΣUA",
+                            (
+                                f"{heat_loss_summary21['total_ua_w_k']:.2f} "
+                                "Вт/К"
+                            ),
+                        )
+
+                        h2.metric(
+                            "Середньозважений U",
+                            (
+                                f"{heat_loss_summary21['area_weighted_u_w_m2_k']:.3f} "
+                                "Вт/(м²·К)"
+                            ),
+                        )
+
+                        h3.metric(
+                            "Пікові втрати",
+                            (
+                                f"{heat_loss_summary21['peak_transmission_heat_loss_kw']:.3f} "
+                                "кВт"
+                            ),
+                        )
+
+                        h4.metric(
+                            "Енергія втрат",
+                            (
+                                f"{heat_loss_summary21['total_transmission_heat_loss_kwh']:.3f} "
+                                "кВт·год"
+                            ),
+                        )
+
+                        st.success(
+                            "У п.21 не введено жодної додаткової площі "
+                            "або окремих дверей: усі вузли та шари "
+                            "походять безпосередньо з п.20."
+                        )
+
+                        st.markdown(
+                            "#### Температурний напір"
+                        )
+
+                        st.line_chart(
+                            heat_loss_profile21[
+                                [
+                                    "heat_loss_chamber_temp_c",
+                                    "heat_loss_ambient_temp_c",
+                                ]
+                            ].rename(
+                                columns={
+                                    "heat_loss_chamber_temp_c": (
+                                        "T камери, °C"
+                                    ),
+                                    "heat_loss_ambient_temp_c": (
+                                        "T зовнішнього повітря, °C"
+                                    ),
+                                }
+                            ),
+                            width="stretch",
+                        )
+
+                        st.markdown(
+                            "#### Теплова потужність втрат"
+                        )
+
+                        st.line_chart(
+                            heat_loss_profile21[
+                                ["heat_loss_power_kw"]
+                            ].rename(
+                                columns={
+                                    "heat_loss_power_kw": (
+                                        "Q̇втр, кВт"
+                                    )
+                                }
+                            ),
+                            width="stretch",
+                        )
+
+                        st.markdown(
+                            "#### Накопичена теплова енергія втрат"
+                        )
+
+                        st.line_chart(
+                            heat_loss_profile21[
+                                [
+                                    "heat_loss_energy_kwh_cumulative"
+                                ]
+                            ].rename(
+                                columns={
+                                    "heat_loss_energy_kwh_cumulative": (
+                                        "Qвтр,Σ, кВт·год"
+                                    )
+                                }
+                            ),
+                            width="stretch",
+                        )
+
+                        st.download_button(
+                            "Завантажити часовий ряд теплових втрат",
+                            data=dataframe_to_csv_bytes(
+                                heat_loss_profile21
+                            ),
+                            file_name=(
+                                "stage21_transmission_heat_losses.csv"
+                            ),
+                            mime="text/csv",
+                            width="stretch",
+                            key="download_stage21_heat_losses_v2",
+                        )
+
+                        st.download_button(
+                            "Завантажити параметри огороджень",
+                            data=dataframe_to_csv_bytes(
+                                heat_loss_envelope21
+                            ),
+                            file_name=(
+                                "stage21_envelope_parameters.csv"
+                            ),
+                            mime="text/csv",
+                            width="stretch",
+                            key="download_stage21_envelope_v2",
+                        )
+
+                        st.info(
+                            "Наступний етап — п.22: рекуперація "
+                            "теплоти відпрацьованого сушильного агента."
+                        )
