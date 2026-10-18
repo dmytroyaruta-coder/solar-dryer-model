@@ -9153,11 +9153,29 @@ with tab_construction_heating:
                 if col in construction_result20.columns
             ]
 
+            stage20_display = construction_result20.loc[
+                construction_result20["include"],
+                existing_cols20,
+            ].copy()
+
+            stage20_display = stage20_display.rename(
+                columns={
+                    "element_role": "Роль елемента",
+                    "assembly": "Вузол огородження",
+                    "component": "Елемент / матеріал",
+                    "area_m2": "A, м²",
+                    "thickness_mm": "δ, мм",
+                    "mass_kg": "m, кг",
+                    "density_kg_m3": "ρ, кг/м³",
+                    "cp_kj_kg_k": "cₚ, кДж/(кг·К)",
+                    "thermal_conductivity_w_m_k": "λ, Вт/(м·К)",
+                    "thermal_capacity_kj_k": "Cᵢ, кДж/К",
+                    "source_note": "Джерело / примітка",
+                }
+            )
+
             st.dataframe(
-                construction_result20.loc[
-                    construction_result20["include"],
-                    existing_cols20,
-                ],
+                stage20_display,
                 width="stretch",
                 hide_index=True,
             )
@@ -9190,16 +9208,26 @@ with tab_construction_heating:
                     "#### Що автоматично передається в п.21"
                 )
 
+                stage20_to21_display = envelope_assemblies20[
+                    [
+                        "assembly",
+                        "area_m2",
+                        "layer_count",
+                        "r_layers_m2_k_w",
+                        "u_layers_w_m2_k",
+                    ]
+                ].copy().rename(
+                    columns={
+                        "assembly": "Вузол огородження",
+                        "area_m2": "A, м²",
+                        "layer_count": "Кількість шарів",
+                        "r_layers_m2_k_w": "Rшарів, м²·К/Вт",
+                        "u_layers_w_m2_k": "1/Rшарів, Вт/(м²·К)",
+                    }
+                )
+
                 st.dataframe(
-                    envelope_assemblies20[
-                        [
-                            "assembly",
-                            "area_m2",
-                            "layer_count",
-                            "r_layers_m2_k_w",
-                            "u_layers_w_m2_k",
-                        ]
-                    ],
+                    stage20_to21_display,
                     width="stretch",
                     hide_index=True,
                 )
@@ -9259,7 +9287,7 @@ with tab_heat_losses:
     )
 
     st.warning(
-        "hвн та hзовн не підставляються програмою довільно. "
+        "hвн і hзовн не підставляються програмою довільно. "
         "Поки ці коефіцієнти не розраховані або не підтверджені, "
         "модель показує лише опір матеріальних шарів Rшарів "
         "і не видає остаточні теплові втрати."
@@ -9306,18 +9334,30 @@ with tab_heat_losses:
                 "#### Шари, автоматично отримані з п.20"
             )
 
+            stage21_layers_display = envelope_layers21[
+                [
+                    "assembly",
+                    "component",
+                    "area_m2",
+                    "thickness_mm",
+                    "thermal_conductivity_w_m_k",
+                    "layer_resistance_m2_k_w",
+                    "source_note",
+                ]
+            ].copy().rename(
+                columns={
+                    "assembly": "Вузол огородження",
+                    "component": "Шар / матеріал",
+                    "area_m2": "A, м²",
+                    "thickness_mm": "δ, мм",
+                    "thermal_conductivity_w_m_k": "λ, Вт/(м·К)",
+                    "layer_resistance_m2_k_w": "Rᵢ, м²·К/Вт",
+                    "source_note": "Джерело / примітка",
+                }
+            )
+
             st.dataframe(
-                envelope_layers21[
-                    [
-                        "assembly",
-                        "component",
-                        "area_m2",
-                        "thickness_mm",
-                        "thermal_conductivity_w_m_k",
-                        "layer_resistance_m2_k_w",
-                        "source_note",
-                    ]
-                ],
+                stage21_layers_display,
                 width="stretch",
                 hide_index=True,
             )
@@ -9326,16 +9366,26 @@ with tab_heat_losses:
                 "#### Термічний опір матеріальних шарів"
             )
 
+            stage21_assemblies_display = envelope_assemblies21[
+                [
+                    "assembly",
+                    "area_m2",
+                    "layer_count",
+                    "r_layers_m2_k_w",
+                    "u_layers_w_m2_k",
+                ]
+            ].copy().rename(
+                columns={
+                    "assembly": "Вузол огородження",
+                    "area_m2": "A, м²",
+                    "layer_count": "Кількість шарів",
+                    "r_layers_m2_k_w": "Rшарів, м²·К/Вт",
+                    "u_layers_w_m2_k": "1/Rшарів, Вт/(м²·К)",
+                }
+            )
+
             st.dataframe(
-                envelope_assemblies21[
-                    [
-                        "assembly",
-                        "area_m2",
-                        "layer_count",
-                        "r_layers_m2_k_w",
-                        "u_layers_w_m2_k",
-                    ]
-                ],
+                stage21_assemblies_display,
                 width="stretch",
                 hide_index=True,
             )
@@ -9351,9 +9401,9 @@ with tab_heat_losses:
                     "assembly": envelope_assemblies21[
                         "assembly"
                     ].tolist(),
-                    "h_inside_w_m2_k": [0.0]
+                    "h_inside_w_m2_k": [None]
                     * len(envelope_assemblies21),
-                    "h_outside_w_m2_k": [0.0]
+                    "h_outside_w_m2_k": [None]
                     * len(envelope_assemblies21),
                     "source_note": [""]
                     * len(envelope_assemblies21),
@@ -9389,11 +9439,9 @@ with tab_heat_losses:
                     "h_inside_w_m2_k",
                     "h_outside_w_m2_k",
                 ]:
-                    surface_form_source21[col] = (
-                        pd.to_numeric(
-                            surface_form_source21[col],
-                            errors="coerce",
-                        ).fillna(0.0)
+                    surface_form_source21[col] = pd.to_numeric(
+                        surface_form_source21[col],
+                        errors="coerce",
                     )
 
                 surface_form_source21["source_note"] = (
@@ -9411,9 +9459,12 @@ with tab_heat_losses:
             )
 
             st.caption(
-                "Введіть hвн та hзовн лише після їх розрахунку "
-                "або обґрунтованого вибору. Значення застосуються "
-                "тільки після натискання кнопки збереження."
+                "Порожнє поле означає, що коефіцієнт ще не визначено. "
+                "Нуль тут не використовується, оскільки h = 0 фізично "
+                "означав би відсутність поверхневого теплообміну. "
+                "Введіть hвн і hзовн лише після їх розрахунку "
+                "або обґрунтованого вибору; значення застосуються "
+                "після натискання кнопки збереження."
             )
 
             with st.form(
@@ -9474,7 +9525,7 @@ with tab_heat_losses:
                 st.info(
                     "Матеріальні шари вже узгоджені з п.20. "
                     "Остаточний U і теплові втрати з'являться після "
-                    "підтвердження hвн та hзовн."
+                    "підтвердження hвн і hзовн."
                 )
 
             else:
@@ -9496,22 +9547,38 @@ with tab_heat_losses:
                         "#### Розрахований коефіцієнт теплопередачі"
                     )
 
+                    stage21_u_display = envelope_full21[
+                        [
+                            "assembly",
+                            "area_m2",
+                            "r_layers_m2_k_w",
+                            "h_inside_w_m2_k",
+                            "r_inside_m2_k_w",
+                            "h_outside_w_m2_k",
+                            "r_outside_m2_k_w",
+                            "r_total_m2_k_w",
+                            "u_value_w_m2_k",
+                            "ua_w_k",
+                            "source_note",
+                        ]
+                    ].copy().rename(
+                        columns={
+                            "assembly": "Вузол огородження",
+                            "area_m2": "A, м²",
+                            "r_layers_m2_k_w": "Rшарів, м²·К/Вт",
+                            "h_inside_w_m2_k": "hвн, Вт/(м²·К)",
+                            "r_inside_m2_k_w": "Rвн, м²·К/Вт",
+                            "h_outside_w_m2_k": "hзовн, Вт/(м²·К)",
+                            "r_outside_m2_k_w": "Rзовн, м²·К/Вт",
+                            "r_total_m2_k_w": "RΣ, м²·К/Вт",
+                            "u_value_w_m2_k": "U, Вт/(м²·К)",
+                            "ua_w_k": "UA, Вт/К",
+                            "source_note": "Джерело / примітка",
+                        }
+                    )
+
                     st.dataframe(
-                        envelope_full21[
-                            [
-                                "assembly",
-                                "area_m2",
-                                "r_layers_m2_k_w",
-                                "h_inside_w_m2_k",
-                                "r_inside_m2_k_w",
-                                "h_outside_w_m2_k",
-                                "r_outside_m2_k_w",
-                                "r_total_m2_k_w",
-                                "u_value_w_m2_k",
-                                "ua_w_k",
-                                "source_note",
-                            ]
-                        ],
+                        stage21_u_display,
                         width="stretch",
                         hide_index=True,
                     )
