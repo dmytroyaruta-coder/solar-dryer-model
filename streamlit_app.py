@@ -5732,6 +5732,629 @@ def calculate_recuperation_potential_stage22(
 
 
 
+
+def calculate_unified_heat_balance_stage23(
+    air_heating_profile: pd.DataFrame,
+    heat_loss_profile: pd.DataFrame,
+    recuperation_profile: pd.DataFrame,
+    product_summary: dict | None,
+    evaporation_summary: dict | None,
+    construction_summary: dict | None,
+    step_minutes: int,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    dict[str, float | int | str],
+]:
+    """
+    Пункт 23. Зведений нестаціонарний тепловий баланс.
+
+    Мета цього етапу — об'єднати ТІЛЬКИ ті складові, які вже
+    розраховані без подвійного обліку.
+
+    Динамічно визначені складові:
+        Qdot_air(t)   — нагрівання свіжого сушильного агента, п.17;
+        Qdot_rec(t)   — повернена відчутна теплота, п.22;
+        Qdot_loss(t)  — трансмісійні втрати через огородження, п.21.
+
+    Для заданого сценарію ефективності рекуператора epsilon:
+        Qdot_air,after_rec(t) =
+            max[Qdot_air(t) - epsilon*Qdot_max_rec(t), 0]
+
+        Qdot_known(t) =
+            Qdot_air,after_rec(t) + Qdot_loss(t)
+
+    ВАЖЛИВО ПРО ВИПАРОВУВАННЯ:
+    у зональній моделі п.15 повітря проходить через зерно
+    приблизно по лінії сталої ентальпії:
+        h_air,out ≈ h_air,in
+    а додана водяна пара супроводжується охолодженням повітря.
+    Тому Q_evap з п.18 є діагностичною енергетичною
+    характеристикою фазового переходу і НЕ додається вдруге
+    до зовнішнього теплового навантаження.
+
+    НАГРІВАННЯ ПРОДУКТУ:
+    п.19 поки дає лише інтегральну проєктну оцінку Q_product,
+    але не Qdot_product(t). Тому її можна показати в балансі
+    циклу, але не можна довільно розподіляти по часових кроках.
+
+    КОНСТРУКЦІЇ:
+    п.20 дає C_constr = sum(m_i*c_p,i), але без T_constr(t)
+    неможливо визначити:
+        Qdot_constr(t) = C_constr * dT_constr/dt
+    Тому теплота накопичення конструкцією тут НЕ вигадується
+    і залишається незамкненим членом балансу.
+
+    Таким чином цей етап формує:
+      1) коректний динамічний баланс уже визначених складових;
+      2) енергетичний реєстр складових, які не слід додавати двічі;
+      3) перелік ще невизначених членів до повного замикання балансу.
+    """
+    import numpy as np
+
+    if step_minutes <= 0:
+        raise ValueError(
+            "Крок моделювання має бути більшим за нуль."
+        )
+
+    n_air = len(air_heating_profile)
+    n_loss = len(heat_loss_profile)
+    n_rec = len(recuperation_profile)
+
+    if not (
+        n_air == n_loss == n_rec
+    ):
+        raise ValueError(
+            "Часові профілі п.17, п.21 і п.22 мають різну довжину."
+        )
+
+    required_air = {
+        "air_heating_power_kw",
+        "active_drying_command",
+        "dry_air_mass_flow_total_kg_h",
+        "zonal_air_inlet_temp_c",
+        "zonal_air_inlet_humidity_ratio_kg_kg",
+        "zonal_air_outlet_temp_c",
+        "zonal_air_outlet_humidity_ratio_kg_kg",
+    }
+
+    required_loss = {
+        "heat_loss_power_kw",
+    }
+
+    required_rec = {
+        "recup_qmax_sensible_kw",
+        "recup_baseline_air_heating_kw",
+    }
+
+    missing_air = required_air - set(
+        air_heating_profile.columns
+    )
+    missing_loss = required_loss - set(
+        heat_loss_profile.columns
+    )
+    missing_rec = required_rec - set(
+        recuperation_profile.columns
+    )
+
+    if missing_air:
+        raise ValueError(
+            "Для п.23 у профілі п.17 відсутні: "
+            + ", ".join(sorted(missing_air))
+        )
+
+    if missing_loss:
+        raise ValueError(
+            "Для п.23 у профілі п.21 відсутні: "
+            + ", ".join(sorted(missing_loss))
+        )
+
+    if missing_rec:
+        raise ValueError(
+            "Для п.23 у профілі п.22 відсутні: "
+            + ", ".join(sorted(missing_rec))
+        )
+
+    result = air_heating_profile.copy()
+
+    q_air_kw = pd.to_numeric(
+        air_heating_profile[
+            "air_heating_power_kw"
+        ],
+        errors="coerce",
+    ).reset_index(drop=True)
+
+    q_loss_kw = pd.to_numeric(
+        heat_loss_profile[
+            "heat_loss_power_kw"
+        ],
+        errors="coerce",
+    ).reset_index(drop=True)
+
+    q_rec_max_kw = pd.to_numeric(
+        recuperation_profile[
+            "recup_qmax_sensible_kw"
+        ],
+        errors="coerce",
+    ).reset_index(drop=True)
+
+    q_rec_baseline_kw = pd.to_numeric(
+        recuperation_profile[
+            "recup_baseline_air_heating_kw"
+        ],
+        errors="coerce",
+    ).reset_index(drop=True)
+
+    active = (
+        air_heating_profile[
+            "active_drying_command"
+        ]
+        .fillna(False)
+        .astype(bool)
+        .reset_index(drop=True)
+    )
+
+    # A missing transmission-loss result in an active interval means
+    # the dynamic balance is not closed for that interval.
+    invalid_loss = (
+        active
+        & q_loss_kw.isna()
+    )
+
+    if invalid_loss.any():
+        raise ValueError(
+            "П.21 не має валідного значення теплових втрат "
+            f"для {int(invalid_loss.sum())} активних інтервалів."
+        )
+
+    q_loss_kw = q_loss_kw.fillna(0.0)
+
+    q_air_kw = q_air_kw.fillna(0.0)
+    q_rec_max_kw = q_rec_max_kw.fillna(0.0)
+    q_rec_baseline_kw = (
+        q_rec_baseline_kw.fillna(0.0)
+    )
+
+    dt_h = float(step_minutes) / 60.0
+
+    # ---------------------------------------------------------
+    # Cross-check 1:
+    # Stage-22 baseline fresh-air heating should reproduce stage 17.
+    # ---------------------------------------------------------
+    baseline_check_kw = (
+        q_air_kw
+        - q_rec_baseline_kw
+    )
+
+    max_baseline_check_error_kw = float(
+        baseline_check_kw.abs().max()
+    )
+
+    # ---------------------------------------------------------
+    # Cross-check 2:
+    # Stage-15 chamber air is treated along constant enthalpy.
+    # This is the key reason why stage-18 evaporation energy must
+    # not be added again as an external heat-demand term.
+    # ---------------------------------------------------------
+    t_in = pd.to_numeric(
+        air_heating_profile[
+            "zonal_air_inlet_temp_c"
+        ],
+        errors="coerce",
+    ).reset_index(drop=True)
+
+    w_in = pd.to_numeric(
+        air_heating_profile[
+            "zonal_air_inlet_humidity_ratio_kg_kg"
+        ],
+        errors="coerce",
+    ).reset_index(drop=True)
+
+    t_out = pd.to_numeric(
+        air_heating_profile[
+            "zonal_air_outlet_temp_c"
+        ],
+        errors="coerce",
+    ).reset_index(drop=True)
+
+    w_out = pd.to_numeric(
+        air_heating_profile[
+            "zonal_air_outlet_humidity_ratio_kg_kg"
+        ],
+        errors="coerce",
+    ).reset_index(drop=True)
+
+    mdot_da_kg_s = (
+        pd.to_numeric(
+            air_heating_profile[
+                "dry_air_mass_flow_total_kg_h"
+            ],
+            errors="coerce",
+        )
+        .reset_index(drop=True)
+        / 3600.0
+    )
+
+    h_in = moist_air_enthalpy_kj_kg_da(
+        temperature_c=t_in,
+        humidity_ratio_kg_kg=w_in,
+    )
+    h_in.index = result.index
+
+    h_out = moist_air_enthalpy_kj_kg_da(
+        temperature_c=t_out,
+        humidity_ratio_kg_kg=w_out,
+    )
+    h_out.index = result.index
+
+    chamber_air_enthalpy_delta_kw = (
+        mdot_da_kg_s.to_numpy()
+        * (
+            h_out.to_numpy()
+            - h_in.to_numpy()
+        )
+    )
+
+    chamber_air_enthalpy_delta_kw = pd.Series(
+        chamber_air_enthalpy_delta_kw,
+        index=result.index,
+        dtype="float64",
+    )
+
+    chamber_air_enthalpy_delta_kw = (
+        chamber_air_enthalpy_delta_kw.where(
+            active.to_numpy(),
+            0.0,
+        )
+    )
+
+    max_chamber_enthalpy_balance_error_kw = float(
+        chamber_air_enthalpy_delta_kw
+        .abs()
+        .max()
+    )
+
+    # Store base diagnostic columns.
+    result["balance_air_heating_no_rec_kw"] = (
+        q_air_kw.to_numpy()
+    )
+
+    result["balance_transmission_loss_kw"] = (
+        q_loss_kw.to_numpy()
+    )
+
+    result["balance_recuperation_qmax_kw"] = (
+        q_rec_max_kw.to_numpy()
+    )
+
+    result[
+        "balance_stage17_vs_stage22_check_kw"
+    ] = baseline_check_kw.to_numpy()
+
+    result[
+        "balance_chamber_air_enthalpy_delta_kw"
+    ] = chamber_air_enthalpy_delta_kw.to_numpy()
+
+    # ---------------------------------------------------------
+    # Parametric balance versus recuperator effectiveness.
+    # No arbitrary design epsilon is selected.
+    # ---------------------------------------------------------
+    epsilon_values = [
+        0.0,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+        1.0,
+    ]
+
+    product_design_kwh = (
+        float(
+            product_summary[
+                "total_initial_product_sensible_heat_kwh"
+            ]
+        )
+        if (
+            product_summary is not None
+            and "total_initial_product_sensible_heat_kwh"
+            in product_summary
+        )
+        else float("nan")
+    )
+
+    evaporation_diag_kwh = (
+        float(
+            evaporation_summary[
+                "total_evaporation_energy_kwh"
+            ]
+        )
+        if (
+            evaporation_summary is not None
+            and "total_evaporation_energy_kwh"
+            in evaporation_summary
+        )
+        else float("nan")
+    )
+
+    construction_capacity_kj_k = (
+        float(
+            construction_summary[
+                "total_thermal_capacity_kj_k"
+            ]
+        )
+        if (
+            construction_summary is not None
+            and "total_thermal_capacity_kj_k"
+            in construction_summary
+        )
+        else float("nan")
+    )
+
+    q_air_no_rec_energy_kwh = float(
+        (q_air_kw * dt_h).sum()
+    )
+
+    q_loss_energy_kwh = float(
+        (q_loss_kw * dt_h).sum()
+    )
+
+    scenario_rows = []
+
+    profile_eps_columns = {}
+
+    for epsilon in epsilon_values:
+        q_rec_kw = (
+            float(epsilon)
+            * q_rec_max_kw
+        )
+
+        # Recovery cannot reduce the external fresh-air heating below zero.
+        q_air_after_rec_kw = (
+            q_air_kw - q_rec_kw
+        ).clip(lower=0.0)
+
+        q_known_kw = (
+            q_air_after_rec_kw
+            + q_loss_kw
+        )
+
+        e_rec_kwh = float(
+            (q_rec_kw * dt_h).sum()
+        )
+
+        e_air_after_rec_kwh = float(
+            (
+                q_air_after_rec_kw
+                * dt_h
+            ).sum()
+        )
+
+        e_known_dynamic_kwh = float(
+            (
+                q_known_kw
+                * dt_h
+            ).sum()
+        )
+
+        e_with_product_design_kwh = (
+            e_known_dynamic_kwh
+            + product_design_kwh
+            if pd.notna(product_design_kwh)
+            else float("nan")
+        )
+
+        scenario_rows.append(
+            {
+                "effectiveness": float(epsilon),
+                "recovered_sensible_energy_kwh": (
+                    e_rec_kwh
+                ),
+                "fresh_air_heating_after_rec_kwh": (
+                    e_air_after_rec_kwh
+                ),
+                "transmission_loss_kwh": (
+                    q_loss_energy_kwh
+                ),
+                "known_dynamic_source_energy_kwh": (
+                    e_known_dynamic_kwh
+                ),
+                "product_design_heat_kwh": (
+                    product_design_kwh
+                ),
+                "known_cycle_energy_plus_product_kwh": (
+                    e_with_product_design_kwh
+                ),
+                "construction_storage_status": (
+                    "не визначено без Tконстр(t)"
+                ),
+                "source_reduction_vs_no_rec_pct": (
+                    (
+                        1.0
+                        - e_known_dynamic_kwh
+                        / (
+                            q_air_no_rec_energy_kwh
+                            + q_loss_energy_kwh
+                        )
+                    )
+                    * 100.0
+                    if (
+                        q_air_no_rec_energy_kwh
+                        + q_loss_energy_kwh
+                    ) > 0
+                    else float("nan")
+                ),
+            }
+        )
+
+        # Keep three illustrative time profiles only.
+        if epsilon in {
+            0.0,
+            0.5,
+            1.0,
+        }:
+            profile_eps_columns[
+                f"balance_known_power_eps_{int(epsilon*100)}_kw"
+            ] = q_known_kw.to_numpy()
+
+    for col, values in profile_eps_columns.items():
+        result[col] = values
+
+    scenarios = pd.DataFrame(
+        scenario_rows
+    )
+
+    # ---------------------------------------------------------
+    # Energy ledger: explicitly states what is added and what is not.
+    # ---------------------------------------------------------
+    ledger_rows = [
+        {
+            "component": (
+                "Нагрівання свіжого сушильного агента, п.17"
+            ),
+            "role": (
+                "Додається до зовнішньої теплової потреби "
+                "до врахування рекуперації"
+            ),
+            "energy_kwh": (
+                q_air_no_rec_energy_kwh
+            ),
+            "time_resolved": "так",
+        },
+        {
+            "component": (
+                "Рекуперація відпрацьованого повітря, п.22"
+            ),
+            "role": (
+                "Віднімається; залежить від εрек"
+            ),
+            "energy_kwh": float("nan"),
+            "time_resolved": "так",
+        },
+        {
+            "component": (
+                "Трансмісійні втрати через огородження, п.21"
+            ),
+            "role": (
+                "Додаються до зовнішньої теплової потреби"
+            ),
+            "energy_kwh": (
+                q_loss_energy_kwh
+            ),
+            "time_resolved": "так",
+        },
+        {
+            "component": (
+                "Теплота фазового переходу води, п.18"
+            ),
+            "role": (
+                "НЕ додається окремо: використовується як "
+                "діагностична характеристика, бо зональна модель "
+                "п.15 уже переносить її через охолодження/зволоження "
+                "повітря при майже сталій ентальпії"
+            ),
+            "energy_kwh": (
+                evaporation_diag_kwh
+            ),
+            "time_resolved": "діагностично",
+        },
+        {
+            "component": (
+                "Нагрівання продукту, п.19"
+            ),
+            "role": (
+                "Може бути додано лише на рівні енергії циклу; "
+                "часовий профіль Q̇прод(t) ще не визначено"
+            ),
+            "energy_kwh": (
+                product_design_kwh
+            ),
+            "time_resolved": "ні",
+        },
+        {
+            "component": (
+                "Акумулювання теплоти конструкцією, п.20"
+            ),
+            "role": (
+                "Ще не додається: відоме Cконстр, але невідоме "
+                "Tконстр(t)"
+            ),
+            "energy_kwh": float("nan"),
+            "time_resolved": "ні",
+        },
+    ]
+
+    ledger = pd.DataFrame(
+        ledger_rows
+    )
+
+    # ---------------------------------------------------------
+    # Summary.
+    # ---------------------------------------------------------
+    no_rec_dynamic_kwh = (
+        q_air_no_rec_energy_kwh
+        + q_loss_energy_kwh
+    )
+
+    eps50_row = scenarios.loc[
+        scenarios["effectiveness"] == 0.5
+    ].iloc[0]
+
+    eps100_row = scenarios.loc[
+        scenarios["effectiveness"] == 1.0
+    ].iloc[0]
+
+    summary = {
+        "air_heating_no_rec_kwh": (
+            q_air_no_rec_energy_kwh
+        ),
+        "transmission_loss_kwh": (
+            q_loss_energy_kwh
+        ),
+        "known_dynamic_no_rec_kwh": (
+            no_rec_dynamic_kwh
+        ),
+        "product_design_heat_kwh": (
+            product_design_kwh
+        ),
+        "evaporation_diagnostic_kwh": (
+            evaporation_diag_kwh
+        ),
+        "construction_capacity_kj_k": (
+            construction_capacity_kj_k
+        ),
+        "known_dynamic_eps50_kwh": float(
+            eps50_row[
+                "known_dynamic_source_energy_kwh"
+            ]
+        ),
+        "known_dynamic_eps100_kwh": float(
+            eps100_row[
+                "known_dynamic_source_energy_kwh"
+            ]
+        ),
+        "max_stage17_stage22_baseline_error_kw": (
+            max_baseline_check_error_kw
+        ),
+        "max_chamber_air_enthalpy_balance_error_kw": (
+            max_chamber_enthalpy_balance_error_kw
+        ),
+        "balance_closure_status": (
+            "частково замкнений: динамічно замкнені повітря, "
+            "рекуперація та трансмісійні втрати; "
+            "Q̇прод(t) і Q̇констр(t) ще не визначені"
+        ),
+    }
+
+    return result, scenarios, ledger, summary
+
+
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Готує CSV у кодуванні UTF-8 з BOM для Excel."""
     return df.reset_index().to_csv(
@@ -5747,7 +6370,7 @@ st.set_page_config(
 
 st.title("Модель комплексної сонячної сушарки")
 st.caption(
-    "Етапи 1–22: вихідні дані, масовий баланс, режими, "
+    "Етапи 1–23: вихідні дані, масовий баланс, режими, "
     "погодні дані, психрометрія, геометрія, кінетика Page, "
     "рівноважна вологість та формування системи "
     "тепло- і масообміну сушильної камери."
@@ -5760,7 +6383,7 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation, tab_product_heating, tab_construction_heating, tab_heat_losses, tab_recuperation = st.tabs(
+tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, tab_kinetics, tab_equilibrium, tab_heat_mass, tab_coupled, tab_performance, tab_air_heating, tab_evaporation, tab_product_heating, tab_construction_heating, tab_heat_losses, tab_recuperation, tab_heat_balance = st.tabs(
     [
         "1. Продукт",
         "2. Тривалість і режими",
@@ -5779,6 +6402,7 @@ tab_product, tab_process, tab_weather, tab_psychro, tab_removal, tab_geometry, t
         "15. Конструкція і теплоємність",
         "16. Теплові втрати",
         "17. Рекуперація",
+        "18. Зведений тепловий баланс",
     ]
 )
 
@@ -11212,9 +11836,404 @@ with tab_recuperation:
                 key="download_stage22_scenarios",
             )
 
+
+# ---------------------------------------------------------------------
+# 18. ЗВЕДЕНИЙ НЕСТАЦІОНАРНИЙ ТЕПЛОВИЙ БАЛАНС
+# ---------------------------------------------------------------------
+with tab_heat_balance:
+    st.subheader(
+        "Етап 23. Зведений нестаціонарний тепловий баланс"
+    )
+
+    st.info(
+        "Мета п.23 — звести вже розраховані складові в одну "
+        "енергетичну схему та не допустити подвійного обліку. "
+        "На цьому етапі програма не вигадує часові профілі "
+        "нагрівання продукту або конструкцій, яких у моделі ще немає."
+    )
+
+    st.markdown(
+        "#### Динамічно замкнена частина балансу"
+    )
+
+    st.latex(
+        r"\dot Q_{\mathrm{пов,після\,рек}}(t,\varepsilon)"
+        r"=\max\left["
+        r"\dot Q_{\mathrm{пов}}(t)"
+        r"-\varepsilon_{\mathrm{рек}}\dot Q_{\max,\mathrm{рек}}(t),"
+        r"0\right]"
+    )
+
+    st.latex(
+        r"\dot Q_{\mathrm{відом}}(t,\varepsilon)"
+        r"="
+        r"\dot Q_{\mathrm{пов,після\,рек}}(t,\varepsilon)"
+        r"+\dot Q_{\mathrm{втр}}(t)"
+    )
+
+    st.write(
+        "Тут **не додається окремо** теплота фазового переходу "
+        "з п.18. У зональній моделі п.15 зволоження повітря "
+        "супроводжується його охолодженням при практично сталій "
+        "ентальпії, тому повторне додавання Qвип завищило б "
+        "зовнішню теплову потребу."
+    )
+
+    st.latex(
+        r"h_{\mathrm{вих,кам}}(t)"
+        r"\approx h_{\mathrm{вх,кам}}(t)"
+    )
+
+    st.markdown(
+        "#### Що ще не можна довільно включити в часовий баланс"
+    )
+
+    st.write(
+        "П.19 дає інтегральну проєктну енергію нагрівання продукту, "
+        "але поки не визначає Q̇прод(t). П.20 дає теплову ємність "
+        "конструкції Cконстр, але без Tконстр(t) неможливо отримати "
+        "Q̇констр(t). Тому ці складові показуються окремо."
+    )
+
+    st.latex(
+        r"\dot Q_{\mathrm{констр}}(t)"
+        r"=C_{\mathrm{констр}}"
+        r"\frac{dT_{\mathrm{констр}}}{dt}"
+    )
+
+    prerequisites23 = [
+        "air_heating_profile",
+        "heat_loss_profile",
+        "recuperation_profile",
+    ]
+
+    missing23 = [
+        key
+        for key in prerequisites23
+        if key not in st.session_state
+    ]
+
+    if missing23:
+        st.warning(
+            "Для п.23 спочатку мають бути сформовані п.17, п.21 "
+            "і п.22. Відсутні: "
+            + ", ".join(missing23)
+        )
+
+    else:
+        try:
+            (
+                heat_balance_profile23,
+                heat_balance_scenarios23,
+                heat_balance_ledger23,
+                heat_balance_summary23,
+            ) = calculate_unified_heat_balance_stage23(
+                air_heating_profile=st.session_state[
+                    "air_heating_profile"
+                ],
+                heat_loss_profile=st.session_state[
+                    "heat_loss_profile"
+                ],
+                recuperation_profile=st.session_state[
+                    "recuperation_profile"
+                ],
+                product_summary=st.session_state.get(
+                    "product_heating_summary"
+                ),
+                evaporation_summary=st.session_state.get(
+                    "evaporation_energy_summary"
+                ),
+                construction_summary=st.session_state.get(
+                    "construction_thermal_capacity_summary"
+                ),
+                step_minutes=int(
+                    model_step_minutes
+                ),
+            )
+
+        except Exception as exc:
+            st.warning(str(exc))
+
+        else:
+            st.session_state[
+                "heat_balance_profile"
+            ] = heat_balance_profile23
+
+            st.session_state[
+                "heat_balance_scenarios"
+            ] = heat_balance_scenarios23
+
+            st.session_state[
+                "heat_balance_ledger"
+            ] = heat_balance_ledger23
+
+            st.session_state[
+                "heat_balance_summary"
+            ] = heat_balance_summary23
+
+            st.markdown(
+                "#### Контроль узгодженості попередніх етапів"
+            )
+
+            k1, k2 = st.columns(2)
+
+            k1.metric(
+                "Макс. різниця п.17 ↔ базова потреба п.22",
+                (
+                    f"{heat_balance_summary23['max_stage17_stage22_baseline_error_kw']:.6f} "
+                    "кВт"
+                ),
+            )
+
+            k2.metric(
+                "Макс. |ΔQ̇ентальпії| через камеру",
+                (
+                    f"{heat_balance_summary23['max_chamber_air_enthalpy_balance_error_kw']:.6f} "
+                    "кВт"
+                ),
+            )
+
+            st.caption(
+                "Перша перевірка контролює, що п.22 використовує ту "
+                "саму базову потребу нагрівання повітря, що й п.17. "
+                "Друга показує, наскільки близько зональна модель п.15 "
+                "дотримується сталої ентальпії сушильного агента."
+            )
+
+            st.markdown(
+                "#### Енергетичний реєстр"
+            )
+
+            ledger_display23 = (
+                heat_balance_ledger23.copy().rename(
+                    columns={
+                        "component": "Складова",
+                        "role": "Роль у п.23",
+                        "energy_kwh": "Енергія, кВт·год",
+                        "time_resolved": "Часовий профіль",
+                    }
+                )
+            )
+
+            st.dataframe(
+                ledger_display23,
+                width="stretch",
+                hide_index=True,
+            )
+
+            s1, s2, s3, s4 = st.columns(4)
+
+            s1.metric(
+                "Нагрівання повітря без рекуперації",
+                (
+                    f"{heat_balance_summary23['air_heating_no_rec_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            s2.metric(
+                "Трансмісійні втрати",
+                (
+                    f"{heat_balance_summary23['transmission_loss_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            s3.metric(
+                "Відомий динамічний баланс, ε=0",
+                (
+                    f"{heat_balance_summary23['known_dynamic_no_rec_kwh']:.3f} "
+                    "кВт·год"
+                ),
+            )
+
+            product23 = heat_balance_summary23[
+                "product_design_heat_kwh"
+            ]
+
+            if pd.notna(product23):
+                product23_text = (
+                    f"{product23:.3f} кВт·год"
+                )
+            else:
+                product23_text = "не визначено"
+
+            s4.metric(
+                "Проєктна теплота нагрівання продукту",
+                product23_text,
+            )
+
+            st.markdown(
+                "#### Параметричний баланс за ефективністю рекуперації"
+            )
+
+            scenario_display23 = (
+                heat_balance_scenarios23.copy()
+            )
+
+            scenario_display23["effectiveness"] = (
+                scenario_display23[
+                    "effectiveness"
+                ]
+                * 100.0
+            )
+
+            scenario_display23 = (
+                scenario_display23.rename(
+                    columns={
+                        "effectiveness": "εрек, %",
+                        "recovered_sensible_energy_kwh": (
+                            "Qрек, кВт·год"
+                        ),
+                        "fresh_air_heating_after_rec_kwh": (
+                            "Qпов після рек., кВт·год"
+                        ),
+                        "transmission_loss_kwh": (
+                            "Qвтр, кВт·год"
+                        ),
+                        "known_dynamic_source_energy_kwh": (
+                            "Eвідом,дин, кВт·год"
+                        ),
+                        "product_design_heat_kwh": (
+                            "Qпрод,проєкт, кВт·год"
+                        ),
+                        "known_cycle_energy_plus_product_kwh": (
+                            "Eвідом + Qпрод, кВт·год"
+                        ),
+                        "construction_storage_status": (
+                            "Конструкція"
+                        ),
+                        "source_reduction_vs_no_rec_pct": (
+                            "Зменшення Eвідом, %"
+                        ),
+                    }
+                )
+            )
+
+            st.dataframe(
+                scenario_display23,
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.caption(
+                "Стовпець «Eвідом + Qпрод» ще НЕ є остаточною "
+                "тепловою потребою установки, оскільки відсутній "
+                "динамічний член накопичення теплоти конструкцією."
+            )
+
+            st.markdown(
+                "#### Динамічна теплова потужність для трьох граничних сценаріїв"
+            )
+
+            st.caption(
+                "ε = 0 %, 50 % і 100 % наведені лише для порівняння; "
+                "це не вибір проєктної ефективності рекуператора."
+            )
+
+            st.line_chart(
+                heat_balance_profile23[
+                    [
+                        "balance_known_power_eps_0_kw",
+                        "balance_known_power_eps_50_kw",
+                        "balance_known_power_eps_100_kw",
+                    ]
+                ].rename(
+                    columns={
+                        "balance_known_power_eps_0_kw": (
+                            "Q̇відом, ε=0 %, кВт"
+                        ),
+                        "balance_known_power_eps_50_kw": (
+                            "Q̇відом, ε=50 %, кВт"
+                        ),
+                        "balance_known_power_eps_100_kw": (
+                            "Q̇відом, ε=100 %, кВт"
+                        ),
+                    }
+                ),
+                width="stretch",
+            )
+
+            st.markdown(
+                "#### Невизначений член конструкції"
+            )
+
+            construction_capacity23 = (
+                heat_balance_summary23[
+                    "construction_capacity_kj_k"
+                ]
+            )
+
+            if pd.notna(
+                construction_capacity23
+            ):
+                st.metric(
+                    "Cконстр",
+                    (
+                        f"{construction_capacity23:.2f} "
+                        "кДж/К"
+                    ),
+                )
+
+                st.write(
+                    "Це значення вже відоме з п.20, але перетворювати "
+                    "його на кВт·год без розрахованого Tконстр(t) "
+                    "програма не буде."
+                )
+
+            evaporation23 = (
+                heat_balance_summary23[
+                    "evaporation_diagnostic_kwh"
+                ]
+            )
+
+            if pd.notna(evaporation23):
+                st.metric(
+                    "Qвип з п.18 — лише діагностична характеристика",
+                    (
+                        f"{evaporation23:.3f} "
+                        "кВт·год"
+                    ),
+                )
+
+            st.warning(
+                "П.23 навмисно не називає поточну суму «остаточною "
+                "тепловою потребою». Для повного нестаціонарного "
+                "балансу ще потрібні температурна динаміка продукту "
+                "та конструкції. Після їх введення баланс можна буде "
+                "замкнути без емпіричного розподілу енергії по часу."
+            )
+
+            st.download_button(
+                "Завантажити часовий ряд п.23",
+                data=dataframe_to_csv_bytes(
+                    heat_balance_profile23
+                ),
+                file_name=(
+                    "stage23_unified_heat_balance_profile.csv"
+                ),
+                mime="text/csv",
+                width="stretch",
+                key="download_stage23_profile",
+            )
+
+            st.download_button(
+                "Завантажити сценарії балансу п.23",
+                data=dataframe_to_csv_bytes(
+                    heat_balance_scenarios23
+                ),
+                file_name=(
+                    "stage23_unified_heat_balance_scenarios.csv"
+                ),
+                mime="text/csv",
+                width="stretch",
+                key="download_stage23_scenarios",
+            )
+
             st.info(
-                "Наступний етап — п.23: єдиний нестаціонарний "
-                "тепловий баланс сушильної камери без подвійного "
-                "обліку теплоти випаровування."
+                "Наступний логічний крок — визначити, як замкнути "
+                "динамічні члени нагрівання продукту та конструкції, "
+                "після чого перейти до потрібної теплової потужності "
+                "джерела і моделі сонячного колектора."
             )
 
